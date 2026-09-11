@@ -1,0 +1,16 @@
+# Example Sanitized /etc/config/firewall (Port 53 DNS Redirection)
+config redirect 'dns_hijack_udp'
+	option name 'Redirect-DNS-UDP'
+	option src 'lan'
+	option proto 'udp'
+	option src_dport '53'
+	option dest_port '53'
+	option target 'DNAT'
+
+config redirect 'dns_hijack_tcp'
+	option name 'Redirect-DNS-TCP'
+	option src 'lan'
+	option proto 'tcp'
+	option src_dport '53'
+	option dest_port '53'
+	option target 'DNAT'

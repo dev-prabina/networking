@@ -1,0 +1,311 @@
+#!/usr/bin/ucode
+import * as ubus from 'ubus';
+import * as fs from 'fs';
+import * as uci from 'uci';
+
+let u = ubus.connect();
+let cursor = uci.cursor();
+
+function get_dns_info() {
+    let result = {
+        mode: 'auto',
+        rebind_protection: true,
+        override_clients: false,
+        override_vpn: false,
+        has_vpn: false,
+        wan_source: 'WAN / ISP (Disconnected)',
+        wan_ipv4: [],
+        wan_ipv6: [],
+        manual_servers: [],
+        hosts: [],
+        service_status: {
+            running: true,
+            service: 'dnsmasq (v2.93)',
+            resolution_working: false
+        }
+    };
+
+    if (!cursor) return result;
+    cursor.load('dhcp');
+    cursor.load('firewall');
+
+    // 1. Dnsmasq configuration
+    let d = cursor.get_all('dhcp', '@dnsmasq[0]') || {};
+    result.rebind_protection = (d.rebind_protection != '0');
+
+    let is_manual = (d.noresolv == '1');
+    result.mode = is_manual ? 'manual' : 'auto';
+
+    let servers = d.server || [];
+    if (type(servers) == 'string') servers = [servers];
+    result.manual_servers = servers;
+
+    // 2. Real Active WAN / ISP DNS from netifd & resolv.conf.auto
+    let wan_ipv4 = [];
+    let wan_ipv6 = [];
+    let active_wan_source = 'WAN / ISP (Disconnected)';
+    let is_wan_online = false;
+
+    if (u) {
+        let dump = u.call('network.interface', 'dump');
+        if (dump && dump.interface) {
+            for (let ifc in dump.interface) {
+                if (ifc.interface != 'lan' && ifc.interface != 'loopback' && ifc.up) {
+                    is_wan_online = true;
+                    active_wan_source = 'WAN / ISP (' + uc(ifc.proto || 'DHCP') + ' - ' + (ifc.l3_device || ifc.device || 'wan') + ')';
+                    if (ifc['dns-server']) {
+                        for (let s in ifc['dns-server']) {
+                            if (index(s, ':') != -1) {
+                                if (index(wan_ipv6, s) == -1) push(wan_ipv6, s);
+                            } else {
+                                if (index(wan_ipv4, s) == -1) push(wan_ipv4, s);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Check /tmp/resolv.conf.d/resolv.conf.auto
+    let auto_raw = fs.readfile('/tmp/resolv.conf.d/resolv.conf.auto') || fs.readfile('/tmp/resolv.conf.auto');
+    if (auto_raw) {
+        let lines = split(trim(auto_raw), '\n');
+        for (let l in lines) {
+            let m = match(l, /^nameserver\s+([a-fA-F0-9\.\:]+)/);
+            if (m) {
+                let ip = m[1];
+                if (ip != '127.0.0.1' && ip != '::1') {
+                    if (index(ip, ':') != -1) {
+                        if (index(wan_ipv6, ip) == -1) push(wan_ipv6, ip);
+                    } else {
+                        if (index(wan_ipv4, ip) == -1) push(wan_ipv4, ip);
+                    }
+                }
+            }
+        }
+    }
+
+    result.wan_source = is_wan_online ? active_wan_source : 'WAN / ISP (Waiting for ISP Connection)';
+    result.wan_ipv4 = wan_ipv4;
+    result.wan_ipv6 = wan_ipv6;
+
+    // 3. DNS Hijack / Interception check in firewall
+    cursor.foreach('firewall', 'redirect', function(r) {
+        if (r.src == 'lan' && (r.src_dport == '53' || r.dest_port == '53') && r.target == 'DNAT') {
+            result.override_clients = true;
+        }
+    });
+
+    // 4. VPN DNS check
+    let vpn_stat = fs.stat('/etc/config/wireguard') || fs.stat('/etc/config/openvpn');
+    result.has_vpn = vpn_stat ? true : false;
+    result.override_vpn = (d.override_vpn == '1');
+
+    // 5. Host entries (config domain in dhcp)
+    cursor.foreach('dhcp', 'domain', function(h) {
+        push(result.hosts, {
+            section: h['.name'],
+            name: h.name || '',
+            ip: h.ip || ''
+        });
+    });
+
+    // 6. Test DNS resolution
+    let ping_test = system('nslookup google.com 127.0.0.1 >/dev/null 2>&1');
+    result.service_status.resolution_working = (ping_test == 0);
+
+    return result;
+}
+
+function apply_dns_settings(params) {
+    if (!cursor) return { success: false, message: 'UCI cursor unavailable' };
+
+    let cur_dhcp = fs.readfile('/etc/config/dhcp');
+    let cur_fw = fs.readfile('/etc/config/firewall');
+
+    try {
+        cursor.load('dhcp');
+        cursor.load('firewall');
+
+        // 1. Rebind Protection
+        if (params.rebind_protection != null) {
+            cursor.set('dhcp', '@dnsmasq[0]', 'rebind_protection', params.rebind_protection ? '1' : '0');
+            cursor.set('dhcp', '@dnsmasq[0]', 'rebind_localhost', params.rebind_protection ? '1' : '0');
+        }
+
+        // 2. DNS Mode & Server Handling (Stale config cleanup)
+        let mode = params.mode || 'auto';
+        if (mode == 'manual') {
+            cursor.set('dhcp', '@dnsmasq[0]', 'noresolv', '1');
+            cursor.delete('dhcp', '@dnsmasq[0]', 'server');
+            let servers = params.servers || [];
+            let valid_servers = [];
+            for (let s in servers) {
+                let s_clean = trim(s);
+                if (s_clean && length(s_clean) > 0) {
+                    push(valid_servers, s_clean);
+                }
+            }
+            if (length(valid_servers) > 0) {
+                cursor.set('dhcp', '@dnsmasq[0]', 'server', valid_servers);
+            }
+        } else {
+            // Auto Mode: Completely clean up all custom server options and noresolv
+            cursor.delete('dhcp', '@dnsmasq[0]', 'noresolv');
+            cursor.delete('dhcp', '@dnsmasq[0]', 'server');
+            cursor.set('dhcp', '@dnsmasq[0]', 'resolvfile', '/tmp/resolv.conf.d/resolv.conf.auto');
+        }
+
+        // 3. Override VPN DNS
+        if (params.override_vpn != null) {
+            cursor.set('dhcp', '@dnsmasq[0]', 'override_vpn', params.override_vpn ? '1' : '0');
+        }
+
+        cursor.commit('dhcp');
+
+        // 4. Override DNS Settings of All Clients (Firewall DNAT Port 53)
+        if (params.override_clients != null) {
+            let want_override = params.override_clients ? true : false;
+            let existing_udp = null;
+            let existing_tcp = null;
+
+            cursor.foreach('firewall', 'redirect', function(r) {
+                if (r.name == 'Redirect-DNS-UDP' || (r.src == 'lan' && r.proto == 'udp' && r.src_dport == '53')) {
+                    existing_udp = r['.name'];
+                }
+                if (r.name == 'Redirect-DNS-TCP' || (r.src == 'lan' && r.proto == 'tcp' && r.src_dport == '53')) {
+                    existing_tcp = r['.name'];
+                }
+            });
+
+            if (want_override) {
+                if (!existing_udp) {
+                    let sec = cursor.add('firewall', 'redirect');
+                    cursor.set('firewall', sec, 'name', 'Redirect-DNS-UDP');
+                    cursor.set('firewall', sec, 'src', 'lan');
+                    cursor.set('firewall', sec, 'proto', 'udp');
+                    cursor.set('firewall', sec, 'src_dport', '53');
+                    cursor.set('firewall', sec, 'dest_port', '53');
+                    cursor.set('firewall', sec, 'target', 'DNAT');
+                }
+                if (!existing_tcp) {
+                    let sec = cursor.add('firewall', 'redirect');
+                    cursor.set('firewall', sec, 'name', 'Redirect-DNS-TCP');
+                    cursor.set('firewall', sec, 'src', 'lan');
+                    cursor.set('firewall', sec, 'proto', 'tcp');
+                    cursor.set('firewall', sec, 'src_dport', '53');
+                    cursor.set('firewall', sec, 'dest_port', '53');
+                    cursor.set('firewall', sec, 'target', 'DNAT');
+                }
+            } else {
+                if (existing_udp) cursor.delete('firewall', existing_udp);
+                if (existing_tcp) cursor.delete('firewall', existing_tcp);
+            }
+            cursor.commit('firewall');
+            system('/etc/init.d/firewall reload >/dev/null 2>&1');
+        }
+
+        // Restart dnsmasq safely
+        system('/etc/init.d/dnsmasq restart >/dev/null 2>&1');
+
+        // Test resolution after apply
+        let test_res = system('nslookup google.com 127.0.0.1 >/dev/null 2>&1');
+
+        return {
+            success: true,
+            message: 'DNS settings applied successfully.',
+            test_passed: (test_res == 0)
+        };
+    } catch (e) {
+        if (cur_dhcp) fs.writefile('/etc/config/dhcp', cur_dhcp);
+        if (cur_fw) fs.writefile('/etc/config/firewall', cur_fw);
+        system('/etc/init.d/dnsmasq restart >/dev/null 2>&1');
+        return { success: false, message: 'Failed to apply DNS settings: ' + e };
+    }
+}
+
+function manage_hosts(action, params) {
+    if (!cursor) return { success: false, message: 'UCI cursor unavailable' };
+    cursor.load('dhcp');
+
+    if (action == 'list') {
+        let list = [];
+        cursor.foreach('dhcp', 'domain', function(h) {
+            push(list, {
+                section: h['.name'],
+                name: h.name || '',
+                ip: h.ip || ''
+            });
+        });
+        return { success: true, hosts: list };
+    } else if (action == 'add') {
+        let name = trim(params.name || '');
+        let ip = trim(params.ip || '');
+        if (!name || !ip) return { success: false, message: 'Hostname and IP Address are required.' };
+
+        let sec = cursor.add('dhcp', 'domain');
+        cursor.set('dhcp', sec, 'name', name);
+        cursor.set('dhcp', sec, 'ip', ip);
+        cursor.commit('dhcp');
+        system('/etc/init.d/dnsmasq reload >/dev/null 2>&1');
+        return { success: true, message: 'Host record added successfully.', section: sec };
+    } else if (action == 'edit') {
+        let sec = params.section;
+        let name = trim(params.name || '');
+        let ip = trim(params.ip || '');
+        if (!sec || !name || !ip) return { success: false, message: 'Section, Hostname, and IP Address are required.' };
+
+        cursor.set('dhcp', sec, 'name', name);
+        cursor.set('dhcp', sec, 'ip', ip);
+        cursor.commit('dhcp');
+        system('/etc/init.d/dnsmasq reload >/dev/null 2>&1');
+        return { success: true, message: 'Host record updated successfully.' };
+    } else if (action == 'delete') {
+        let sec = params.section;
+        if (!sec) return { success: false, message: 'Section name required.' };
+
+        cursor.delete('dhcp', sec);
+        cursor.commit('dhcp');
+        system('/etc/init.d/dnsmasq reload >/dev/null 2>&1');
+        return { success: true, message: 'Host record deleted successfully.' };
+    }
+    return { success: false, message: 'Unknown action' };
+}
+
+function test_dns() {
+    let test_res = system('nslookup google.com 127.0.0.1 >/dev/null 2>&1');
+    let cf_res = system('nslookup cloudflare.com 127.0.0.1 >/dev/null 2>&1');
+    return {
+        service_running: true,
+        resolution_working: (test_res == 0 || cf_res == 0),
+        timestamp: time()
+    };
+}
+
+let action = ARGV[0];
+let method = ARGV[1];
+
+if (action == 'list') {
+    print('{"get_dns_info": {}, "apply_dns_settings": {"mode": "String", "rebind_protection": "Boolean", "override_clients": "Boolean", "override_vpn": "Boolean", "servers": "Array"}, "manage_hosts": {"action": "String", "params": "Object"}, "test_dns": {}}\n');
+} else if (action == 'call' && method == 'get_dns_info') {
+    print(sprintf('%J\n', get_dns_info()));
+} else if (action == 'call' && method == 'apply_dns_settings') {
+    let input = {};
+    let line = fs.readfile('/dev/stdin');
+    if (line) {
+        try { input = json(line); } catch(e) {}
+    }
+    print(sprintf('%J\n', apply_dns_settings(input)));
+} else if (action == 'call' && method == 'manage_hosts') {
+    let input = {};
+    let line = fs.readfile('/dev/stdin');
+    if (line) {
+        try { input = json(line); } catch(e) {}
+    }
+    print(sprintf('%J\n', manage_hosts(input.action, input.params || {})));
+} else if (action == 'call' && method == 'test_dns') {
+    print(sprintf('%J\n', test_dns()));
+} else {
+    print(sprintf('%J\n', get_dns_info()));
+}

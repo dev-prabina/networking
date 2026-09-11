@@ -1,0 +1,408 @@
+#!/usr/bin/env ucode
+import * as ubus from 'ubus';
+import * as fs from 'fs';
+import * as uci from 'uci';
+
+let u = ubus.connect();
+let cursor = uci.cursor();
+
+let STATUS_FILE = '/tmp/prime_loadbalance_status.json';
+
+// In-memory state tracking
+let state = {
+    wan1: {
+        interface: 'wan',
+        device: 'wan',
+        proto: 'dhcp',
+        connected: false,
+        ip: null,
+        gateway: null,
+        dns: [],
+        status: 'offline', // 'healthy', 'failing', 'offline'
+        latency: 0,
+        packet_loss: 100,
+        consecutive_fails: 0,
+        consecutive_success: 0,
+        last_check_sec: 0,
+        rx_rate_bps: 0,
+        tx_rate_bps: 0,
+        total_rx_bytes: 0,
+        total_tx_bytes: 0,
+        last_rx_bytes: 0,
+        last_tx_bytes: 0
+    },
+    wan2: {
+        interface: 'wan2',
+        device: 'lan1',
+        proto: 'dhcp',
+        connected: false,
+        ip: null,
+        gateway: null,
+        dns: [],
+        status: 'offline',
+        latency: 0,
+        packet_loss: 100,
+        consecutive_fails: 0,
+        consecutive_success: 0,
+        last_check_sec: 0,
+        rx_rate_bps: 0,
+        tx_rate_bps: 0,
+        total_rx_bytes: 0,
+        total_tx_bytes: 0,
+        last_rx_bytes: 0,
+        last_tx_bytes: 0
+    },
+    config: {
+        enabled: false,
+        mode: 'balanced',
+        wan1_weight: 50,
+        wan2_weight: 50,
+        auto_failover: true,
+        preferred_wan: 'wan1',
+        check_interval: 3,
+        check_timeout: 2,
+        failure_threshold: 3,
+        recovery_threshold: 2,
+        check_targets: ['1.1.1.1', '8.8.8.8', '9.9.9.9']
+    },
+    active_policy: 'WAN1_ONLY',
+    last_update_ts: time()
+};
+
+function read_config() {
+    if (!cursor) return;
+    cursor.load('loadbalance');
+    let cfg = cursor.get_all('loadbalance', 'global') || {};
+    state.config.enabled = (cfg.enabled == '1');
+    state.config.mode = cfg.mode || 'balanced';
+    state.config.wan1_weight = int(cfg.wan1_weight || 50);
+    state.config.wan2_weight = int(cfg.wan2_weight || 50);
+    state.config.auto_failover = (cfg.auto_failover != '0');
+    state.config.preferred_wan = cfg.preferred_wan || 'wan1';
+    state.config.check_interval = int(cfg.check_interval || 3);
+    state.config.check_timeout = int(cfg.check_timeout || 2);
+    state.config.failure_threshold = int(cfg.failure_threshold || 3);
+    state.config.recovery_threshold = int(cfg.recovery_threshold || 2);
+    if (type(cfg.check_targets) == 'array' && length(cfg.check_targets) > 0) {
+        state.config.check_targets = cfg.check_targets;
+    }
+}
+
+function get_iface_info(ifname) {
+    if (!u) return null;
+    let s = u.call('network.interface.' + ifname, 'status');
+    if (!s) return null;
+
+    let ip = null;
+    if (s['ipv4-address'] && length(s['ipv4-address']) > 0) {
+        ip = s['ipv4-address'][0].address;
+    }
+    let gw = null;
+    if (s.route && length(s.route) > 0) {
+        for (let r in s.route) {
+            if (r.target == '0.0.0.0' && r.nexthop) {
+                gw = r.nexthop;
+                break;
+            }
+        }
+    }
+    let dns = s['dns-server'] || [];
+
+    return {
+        up: (s.up == true),
+        device: s.l3_device || s.device || ifname,
+        proto: s.proto || 'dhcp',
+        ip: ip,
+        gateway: gw,
+        dns: dns
+    };
+}
+
+function probe_target(dev, target, timeout_sec) {
+    let cmd = sprintf('ping -c 1 -W %d -I %s %s 2>&1', timeout_sec, dev, target);
+    let p = fs.popen(cmd);
+    if (!p) return -1;
+    let out = p.read('all');
+    p.close();
+
+    if (!out) return -1;
+    let m = match(out, /time=([0-9\.]+)\s*ms/);
+    if (m && m[1]) {
+        return +m[1];
+    }
+    return -1;
+}
+
+function update_traffic_stats(w, dev) {
+    if (!dev) return;
+    let rx_p = '/sys/class/net/' + dev + '/statistics/rx_bytes';
+    let tx_p = '/sys/class/net/' + dev + '/statistics/tx_bytes';
+    let rx_str = fs.readfile(rx_p);
+    let tx_str = fs.readfile(tx_p);
+    if (rx_str && tx_str) {
+        let cur_rx = int(trim(rx_str));
+        let cur_tx = int(trim(tx_str));
+        w.total_rx_bytes = cur_rx;
+        w.total_tx_bytes = cur_tx;
+
+        if (w.last_rx_bytes > 0 && cur_rx >= w.last_rx_bytes) {
+            let dt = state.config.check_interval || 3;
+            w.rx_rate_bps = int(((cur_rx - w.last_rx_bytes) * 8) / dt);
+            w.tx_rate_bps = int(((cur_tx - w.last_tx_bytes) * 8) / dt);
+        }
+        w.last_rx_bytes = cur_rx;
+        w.last_tx_bytes = cur_tx;
+    }
+}
+
+function setup_routing_tables() {
+    // 1. Ensure IP rules exist
+    system('ip rule del pref 1000 2>/dev/null || true');
+    system('ip rule del pref 2000 2>/dev/null || true');
+    system('ip rule del pref 500 2>/dev/null || true');
+    system('ip rule del pref 501 2>/dev/null || true');
+
+    if (!state.config.enabled) {
+        system('ip route flush table 100 2>/dev/null || true');
+        system('ip route flush table 200 2>/dev/null || true');
+        system('nft delete table inet prime_loadbalance 2>/dev/null || true');
+        return;
+    }
+
+    system('ip rule add fwmark 0x100/0xff00 lookup 100 pref 1000 2>/dev/null || true');
+    system('ip rule add fwmark 0x200/0xff00 lookup 200 pref 2000 2>/dev/null || true');
+
+    if (state.wan1.ip) {
+        system(sprintf('ip rule add from %s lookup 100 pref 500 2>/dev/null || true', state.wan1.ip));
+    }
+    if (state.wan2.ip) {
+        system(sprintf('ip rule add from %s lookup 200 pref 501 2>/dev/null || true', state.wan2.ip));
+    }
+
+    // Update table 100
+    if (state.wan1.connected && state.wan1.device) {
+        if (state.wan1.gateway) {
+            system(sprintf('ip route replace default via %s dev %s table 100 2>/dev/null || true', state.wan1.gateway, state.wan1.device));
+        } else {
+            system(sprintf('ip route replace default dev %s table 100 2>/dev/null || true', state.wan1.device));
+        }
+    } else {
+        system('ip route flush table 100 2>/dev/null || true');
+    }
+
+    // Update table 200
+    if (state.wan2.connected && state.wan2.device) {
+        if (state.wan2.gateway) {
+            system(sprintf('ip route replace default via %s dev %s table 200 2>/dev/null || true', state.wan2.gateway, state.wan2.device));
+        } else {
+            system(sprintf('ip route replace default dev %s table 200 2>/dev/null || true', state.wan2.device));
+        }
+    } else {
+        system('ip route flush table 200 2>/dev/null || true');
+    }
+}
+
+function update_nftables_policy() {
+    if (!state.config.enabled) {
+        system('nft delete table inet prime_loadbalance 2>/dev/null || true');
+        state.active_policy = 'DUAL_WAN_DISABLED';
+        return;
+    }
+
+    let wan1_healthy = (state.wan1.connected && state.wan1.status == 'healthy');
+    let wan2_healthy = (state.wan2.connected && state.wan2.status == 'healthy');
+
+    let rule_stmt = '';
+    if (wan1_healthy && wan2_healthy) {
+        let w1 = state.config.wan1_weight;
+        let w2 = state.config.wan2_weight;
+        if (w1 <= 0) {
+            rule_stmt = 'meta mark set 0x200';
+            state.active_policy = 'WAN2_ONLY_CONFIGURED';
+        } else if (w2 <= 0 || w1 >= 100) {
+            rule_stmt = 'meta mark set 0x100';
+            state.active_policy = 'WAN1_ONLY_CONFIGURED';
+        } else {
+            let split_idx = w1 - 1;
+            rule_stmt = sprintf('meta mark set numgen random mod 100 map { 0-%d : 0x100, %d-99 : 0x200 }', split_idx, w1);
+            state.active_policy = sprintf('BALANCED_%d_%d', w1, w2);
+        }
+    } else if (wan1_healthy && !wan2_healthy) {
+        rule_stmt = 'meta mark set 0x100';
+        state.active_policy = 'FAILOVER_WAN1';
+    } else if (!wan1_healthy && wan2_healthy) {
+        rule_stmt = 'meta mark set 0x200';
+        state.active_policy = 'FAILOVER_WAN2';
+    } else {
+        // Both down
+        rule_stmt = (state.config.preferred_wan == 'wan2') ? 'meta mark set 0x200' : 'meta mark set 0x100';
+        state.active_policy = 'NO_INTERNET';
+    }
+
+    let nft_script = sprintf(`
+table inet prime_loadbalance {
+    chain prerouting {
+        type filter hook prerouting priority mangle; policy accept;
+        iifname != "br-lan" return;
+        ip daddr { 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255/32 } return;
+        ct mark != 0 meta mark set ct mark;
+        meta mark != 0 return;
+        ct state new %s;
+        ct state new ct mark set meta mark;
+    }
+}
+`, rule_stmt);
+
+    fs.writefile('/tmp/prime_loadbalance.nft', nft_script);
+    system('nft -f /tmp/prime_loadbalance.nft 2>/dev/null || true');
+}
+
+function check_health() {
+    read_config();
+
+    // 1. Check WAN1 info
+    let w1_info = get_iface_info('wan') || get_iface_info('usbwan') || get_iface_info('wwan');
+    if (w1_info && w1_info.up && w1_info.ip) {
+        state.wan1.connected = true;
+        state.wan1.device = w1_info.device;
+        state.wan1.proto = w1_info.proto;
+        state.wan1.ip = w1_info.ip;
+        state.wan1.gateway = w1_info.gateway;
+        state.wan1.dns = w1_info.dns;
+        update_traffic_stats(state.wan1, w1_info.device);
+
+        // Ping test
+        let latencies = [];
+        let fails = 0;
+        let targets = state.config.check_targets || ['1.1.1.1', '8.8.8.8'];
+        for (let t in targets) {
+            let lat = probe_target(w1_info.device, t, state.config.check_timeout || 2);
+            if (lat > 0) push(latencies, lat);
+            else fails++;
+        }
+
+        let total_probes = length(targets);
+        let loss = int((fails * 100) / (total_probes > 0 ? total_probes : 1));
+        state.wan1.packet_loss = loss;
+
+        if (length(latencies) > 0) {
+            let sum = 0;
+            for (let l in latencies) sum += l;
+            state.wan1.latency = int(sum / length(latencies));
+            state.wan1.consecutive_success++;
+            state.wan1.consecutive_fails = 0;
+            if (state.wan1.consecutive_success >= (state.config.recovery_threshold || 2)) {
+                state.wan1.status = 'healthy';
+            }
+        } else {
+            state.wan1.consecutive_fails++;
+            state.wan1.consecutive_success = 0;
+            if (state.wan1.consecutive_fails >= (state.config.failure_threshold || 3)) {
+                state.wan1.status = 'failing';
+            }
+        }
+        state.wan1.last_check_sec = 0;
+    } else {
+        state.wan1.connected = false;
+        state.wan1.status = 'offline';
+        state.wan1.ip = null;
+        state.wan1.gateway = null;
+        state.wan1.dns = [];
+        state.wan1.latency = 0;
+        state.wan1.packet_loss = 100;
+        state.wan1.rx_rate_bps = 0;
+        state.wan1.tx_rate_bps = 0;
+    }
+
+    // 2. Check WAN2 info (only if Dual-WAN is enabled)
+    if (state.config.enabled) {
+        let w2_info = get_iface_info('wan2');
+        if (w2_info && w2_info.up && w2_info.ip) {
+            state.wan2.connected = true;
+            state.wan2.device = w2_info.device;
+            state.wan2.proto = w2_info.proto;
+            state.wan2.ip = w2_info.ip;
+            state.wan2.gateway = w2_info.gateway;
+            state.wan2.dns = w2_info.dns;
+            update_traffic_stats(state.wan2, w2_info.device);
+
+            // Ping test
+            let latencies = [];
+            let fails = 0;
+            let targets = state.config.check_targets || ['1.1.1.1', '8.8.8.8'];
+            for (let t in targets) {
+                let lat = probe_target(w2_info.device, t, state.config.check_timeout || 2);
+                if (lat > 0) push(latencies, lat);
+                else fails++;
+            }
+
+            let total_probes = length(targets);
+            let loss = int((fails * 100) / (total_probes > 0 ? total_probes : 1));
+            state.wan2.packet_loss = loss;
+
+            if (length(latencies) > 0) {
+                let sum = 0;
+                for (let l in latencies) sum += l;
+                state.wan2.latency = int(sum / length(latencies));
+                state.wan2.consecutive_success++;
+                state.wan2.consecutive_fails = 0;
+                if (state.wan2.consecutive_success >= (state.config.recovery_threshold || 2)) {
+                    state.wan2.status = 'healthy';
+                }
+            } else {
+                state.wan2.consecutive_fails++;
+                state.wan2.consecutive_success = 0;
+                if (state.wan2.consecutive_fails >= (state.config.failure_threshold || 3)) {
+                    state.wan2.status = 'failing';
+                }
+            }
+            state.wan2.last_check_sec = 0;
+        } else {
+            state.wan2.connected = false;
+            state.wan2.status = 'offline';
+            state.wan2.ip = null;
+            state.wan2.gateway = null;
+            state.wan2.dns = [];
+            state.wan2.latency = 0;
+            state.wan2.packet_loss = 100;
+            state.wan2.rx_rate_bps = 0;
+            state.wan2.tx_rate_bps = 0;
+        }
+    } else {
+        state.wan2.connected = false;
+        state.wan2.status = 'offline';
+        state.wan2.ip = null;
+        state.wan2.gateway = null;
+        state.wan2.dns = [];
+        state.wan2.latency = 0;
+        state.wan2.packet_loss = 100;
+        state.wan2.rx_rate_bps = 0;
+        state.wan2.tx_rate_bps = 0;
+    }
+
+    state.last_update_ts = time();
+
+    // 3. Update routing & nftables rules
+    setup_routing_tables();
+    update_nftables_policy();
+
+    // 4. Atomic status dump
+    fs.writefile('/tmp/prime_loadbalance_status.tmp', sprintf('%J\n', state));
+    fs.rename('/tmp/prime_loadbalance_status.tmp', STATUS_FILE);
+}
+
+// Single-run mode or loop mode
+let mode = ARGV[0];
+if (mode == 'run-once') {
+    check_health();
+} else {
+    // Daemon loop
+    while (true) {
+        try {
+            check_health();
+        } catch(e) {}
+        let intvl = state.config.check_interval || 3;
+        if (intvl < 1) intvl = 1;
+        sleep(intvl * 1000);
+    }
+}

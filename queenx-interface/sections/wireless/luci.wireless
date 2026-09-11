@@ -1,0 +1,290 @@
+#!/usr/bin/ucode
+import * as ubus from 'ubus';
+import * as fs from 'fs';
+import * as uci from 'uci';
+
+let u = ubus.connect();
+let cursor = uci.cursor();
+
+function get_wireless_info() {
+    let result = {
+        radios: []
+    };
+
+    if (!cursor) return result;
+    cursor.load('wireless');
+
+    let iwinfo_data = {};
+    if (u) {
+        let devs = u.call('network.wireless', 'status');
+        if (devs) {
+            for (let r in devs) {
+                let info = u.call('iwinfo', 'info', { device: r });
+                let freq = u.call('iwinfo', 'freqlist', { device: r });
+                let tx = u.call('iwinfo', 'txpowerlist', { device: r });
+                let ht = u.call('iwinfo', 'htmodelist', { device: r });
+                let hw = u.call('iwinfo', 'hwmodelist', { device: r });
+                iwinfo_data[r] = {
+                    status: devs[r],
+                    info: info,
+                    freqlist: freq ? freq.results : [],
+                    txpowerlist: tx ? tx.results : [],
+                    htmodelist: ht ? ht.results : [],
+                    hwmodelist: hw ? hw.results : []
+                };
+            }
+        }
+    }
+
+    cursor.foreach('wireless', 'wifi-device', function(dev) {
+        let dev_name = dev['.name'];
+        let band = (dev.band == '5g' || dev.band == '6g' || index(dev_name, '1') != -1) ? '5g' : '2g';
+        let band_label = (band == '5g') ? '5 GHz' : '2.4 GHz';
+
+        let iw_info = iwinfo_data[dev_name] ? iwinfo_data[dev_name].info : null;
+        let channels = iwinfo_data[dev_name] ? iwinfo_data[dev_name].freqlist : [];
+        let txpowers = iwinfo_data[dev_name] ? iwinfo_data[dev_name].txpowerlist : [];
+        let htmodes = iwinfo_data[dev_name] ? iwinfo_data[dev_name].htmodelist : [];
+
+        let max_txpower = 30;
+        if (length(txpowers) > 0) {
+            max_txpower = txpowers[length(txpowers) - 1].dbm;
+        }
+
+        let ifaces = [];
+        let has_guest = false;
+
+        cursor.foreach('wireless', 'wifi-iface', function(ifc) {
+            if (ifc.device == dev_name) {
+                let sec_name = ifc['.name'];
+                let ifname = ifc.ifname;
+
+                let is_guest = (ifc.isolate == '1' || index(sec_name, 'guest') != -1 || index(ifc.ssid || '', 'Guest') != -1);
+                if (is_guest) has_guest = true;
+                let ifc_label = band_label + (is_guest ? ' Guest Wi-Fi' : ' Wi-Fi');
+
+                let client_cnt = 0;
+                if (u && ifname) {
+                    let hapd = u.call('hostapd.' + ifname, 'get_clients');
+                    if (hapd && hapd.clients) {
+                        client_cnt = length(keys(hapd.clients));
+                    }
+                }
+
+                // Check individual interface disabled state
+                let is_ifc_disabled = (ifc.disabled == '1');
+
+                push(ifaces, {
+                    section: sec_name,
+                    device: dev_name,
+                    ifname: ifname,
+                    is_guest: is_guest,
+                    label: ifc_label,
+                    ssid: ifc.ssid || '',
+                    encryption: ifc.encryption || 'none',
+                    key: ifc.key || '',
+                    hidden: (ifc.hidden == '1'),
+                    disabled: is_ifc_disabled,
+                    random_bssid: (ifc.random_bssid == '1'),
+                    isolate: (ifc.isolate == '1'),
+                    clients_count: client_cnt,
+                    exists: true
+                });
+            }
+        });
+
+        // If guest network is not configured yet in UCI, provide guest template
+        if (!has_guest) {
+            let primary_ssid = length(ifaces) > 0 ? ifaces[0].ssid : 'OpenWrt';
+            push(ifaces, {
+                section: 'guest_' + dev_name,
+                device: dev_name,
+                ifname: null,
+                is_guest: true,
+                label: band_label + ' Guest Wi-Fi',
+                ssid: primary_ssid + '-Guest',
+                encryption: 'psk2',
+                key: 'guest12345',
+                hidden: false,
+                disabled: true,
+                random_bssid: false,
+                isolate: true,
+                clients_count: 0,
+                exists: false
+            });
+        }
+
+        let cur_channel = dev.channel || (iw_info ? iw_info.channel : 'auto');
+        let cur_htmode = dev.htmode || (iw_info ? iw_info.htmode : ((band == '5g') ? 'HE80' : 'HE20'));
+        let cur_txpower = dev.txpower || (iw_info ? iw_info.txpower : max_txpower);
+
+        push(result.radios, {
+            radio: dev_name,
+            band: band,
+            band_label: band_label,
+            disabled: (dev.disabled == '1'),
+            channel: cur_channel,
+            htmode: cur_htmode,
+            txpower: cur_txpower,
+            max_txpower: max_txpower,
+            country: dev.country || 'PA',
+            hwmode: iw_info ? iw_info.hwmodes : null,
+            supported_channels: channels,
+            supported_txpowers: txpowers,
+            supported_htmodes: htmodes,
+            interfaces: ifaces
+        });
+    });
+
+    return result;
+}
+
+function modify_wireless(params) {
+    if (!cursor) return { success: false, message: 'UCI unavailable' };
+
+    let radio = params.radio;
+    let iface_sec = params.iface_section;
+
+    if (!radio || !iface_sec) {
+        return { success: false, message: 'Missing radio or interface target' };
+    }
+
+    let ssid = trim(params.ssid || '');
+    if (length(ssid) == 0 || length(ssid) > 32) {
+        return { success: false, message: 'SSID must be between 1 and 32 characters.' };
+    }
+
+    let enc = params.encryption || 'none';
+    let key = trim(params.key || '');
+    if (enc != 'none') {
+        if (length(key) < 8 || length(key) > 63) {
+            return { success: false, message: 'Wi-Fi Password must be between 8 and 63 characters for WPA2/WPA3.' };
+        }
+    }
+
+    // Backup current wireless config before changes
+    let cur_cfg = fs.readfile('/etc/config/wireless');
+    if (cur_cfg) {
+        fs.writefile('/tmp/wireless.bak', cur_cfg);
+    }
+
+    try {
+        cursor.load('wireless');
+
+        // Apply Radio-level options (Channel, HTMode, TXPower)
+        if (params.txpower != null && params.txpower != '') {
+            cursor.set('wireless', radio, 'txpower', sprintf('%d', int(params.txpower)));
+        }
+        if (params.channel != null && params.channel != '') {
+            cursor.set('wireless', radio, 'channel', (params.channel == 'auto' || params.channel == '0') ? 'auto' : sprintf('%d', int(params.channel)));
+        }
+        if (params.htmode != null && params.htmode != '') {
+            cursor.set('wireless', radio, 'htmode', params.htmode);
+        }
+
+        // Check if interface section exists or needs creation (e.g. Guest Wi-Fi)
+        let sec_type = cursor.get('wireless', iface_sec);
+        if (!sec_type) {
+            cursor.set('wireless', iface_sec, 'wifi-iface');
+            cursor.set('wireless', iface_sec, 'device', radio);
+            cursor.set('wireless', iface_sec, 'network', 'lan');
+            cursor.set('wireless', iface_sec, 'mode', 'ap');
+            cursor.set('wireless', iface_sec, 'isolate', '1');
+        }
+
+        // Apply Interface-level options
+        cursor.set('wireless', iface_sec, 'ssid', ssid);
+        cursor.set('wireless', iface_sec, 'encryption', enc);
+
+        if (enc == 'none') {
+            cursor.delete('wireless', iface_sec, 'key');
+        } else {
+            cursor.set('wireless', iface_sec, 'key', key);
+        }
+
+        if (params.hidden != null) {
+            if (params.hidden === true || params.hidden === 1 || params.hidden === '1') {
+                cursor.set('wireless', iface_sec, 'hidden', '1');
+            } else {
+                cursor.delete('wireless', iface_sec, 'hidden');
+            }
+        }
+
+        // ISOLATED INTERFACE DISABLED CONTROL
+        // Setting iface_disabled ONLY changes this specific interface!
+        if (params.iface_disabled != null) {
+            if (params.iface_disabled === true || params.iface_disabled === 1 || params.iface_disabled === '1') {
+                cursor.set('wireless', iface_sec, 'disabled', '1');
+            } else {
+                cursor.delete('wireless', iface_sec, 'disabled');
+            }
+        }
+
+        if (params.random_bssid != null) {
+            if (params.random_bssid === true || params.random_bssid === 1 || params.random_bssid === '1') {
+                cursor.set('wireless', iface_sec, 'random_bssid', '1');
+            } else {
+                cursor.delete('wireless', iface_sec, 'random_bssid');
+            }
+        }
+
+        // SMART RADIO CHIP STATE RECONCILIATION:
+        // Ensure the physical radio device is ENABLED as long as at least ONE interface on it is enabled!
+        let any_ifc_enabled = false;
+        cursor.foreach('wireless', 'wifi-iface', function(ifc) {
+            if (ifc.device == radio) {
+                if (ifc['.name'] == iface_sec) {
+                    if (params.iface_disabled !== true && params.iface_disabled !== 1 && params.iface_disabled !== '1') {
+                        any_ifc_enabled = true;
+                    }
+                } else {
+                    if (ifc.disabled != '1') {
+                        any_ifc_enabled = true;
+                    }
+                }
+            }
+        });
+
+        if (any_ifc_enabled) {
+            // Unconditionally keep physical radio device ENABLED
+            cursor.delete('wireless', radio, 'disabled');
+        } else {
+            // Only disable physical radio if ALL interfaces on this radio are disabled
+            cursor.set('wireless', radio, 'disabled', '1');
+        }
+
+        cursor.commit('wireless');
+
+        // Reload Wi-Fi safely (least disruptive)
+        system('/sbin/wifi reload >/dev/null 2>&1');
+
+        return {
+            success: true,
+            message: 'Wireless settings updated and applied successfully.'
+        };
+    } catch (e) {
+        if (cur_cfg) {
+            fs.writefile('/etc/config/wireless', cur_cfg);
+            system('/sbin/wifi reload >/dev/null 2>&1');
+        }
+        return { success: false, message: 'Failed to update wireless settings: ' + e };
+    }
+}
+
+let action = ARGV[0];
+let method = ARGV[1];
+
+if (action == 'list') {
+    print('{"get_wireless_info": {}, "modify_wireless": {}}\n');
+} else if (action == 'call' && method == 'get_wireless_info') {
+    print(sprintf('%J\n', get_wireless_info()));
+} else if (action == 'call' && method == 'modify_wireless') {
+    let input = {};
+    let line = fs.readfile('/dev/stdin');
+    if (line) {
+        try { input = json(line); } catch(e) {}
+    }
+    print(sprintf('%J\n', modify_wireless(input)));
+} else {
+    print(sprintf('%J\n', get_wireless_info()));
+}

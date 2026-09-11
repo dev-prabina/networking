@@ -1,0 +1,32 @@
+{
+	"luci-app-queenx": {
+		"description": "Grant access to Controls Management Section",
+		"read": {
+			"ubus": {
+				"luci.internet": [ "*" ],
+				"luci.wireless": [ "*" ],
+				"luci.clients": [ "*" ],
+				"luci.macfilter": [ "*" ],
+				"luci.dns": [ "*" ],
+				"luci.loadbalance": [ "*" ],
+				"network.wireless": [ "*" ],
+				"network.interface.*": [ "*" ],
+				"iwinfo": [ "*" ],
+				"hostapd.*": [ "*" ]
+			},
+			"uci": [ "wireless", "network", "dhcp", "macfilter", "firewall", "loadbalance" ]
+		},
+		"write": {
+			"ubus": {
+				"luci.internet": [ "*" ],
+				"luci.wireless": [ "*" ],
+				"luci.clients": [ "*" ],
+				"luci.macfilter": [ "*" ],
+				"luci.dns": [ "*" ],
+				"luci.loadbalance": [ "*" ],
+				"network.wireless": [ "*" ]
+			},
+			"uci": [ "wireless", "network", "dhcp", "macfilter", "firewall", "loadbalance" ]
+		}
+	}
+}

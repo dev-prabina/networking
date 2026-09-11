@@ -1,0 +1,443 @@
+#!/bin/sh
+
+. /lib/functions.sh
+. /usr/share/libubox/jshn.sh
+
+readonly UPLOAD_FILE="/tmp/maclist.txt"
+readonly BACKUP_FILE="/etc/config/macfilter.backup"
+
+normalize_mac() {
+	echo "$1" | tr 'a-z' 'A-Z' | tr '-' ':' | tr -d ' \t\r\n'
+}
+
+is_valid_mac() {
+	echo "$1" | grep -Eq '^([0-9A-F]{2}:){5}[0-9A-F]{2}$'
+}
+
+get_ap_ifaces() {
+	local ifaces=""
+	cb_find_ap() {
+		local cfg="$1"
+		local mode
+		config_get mode "$cfg" mode "ap"
+		if [ "$mode" = "ap" ] || [ "$mode" = "ap-wds" ]; then
+			ifaces="$ifaces $cfg"
+		fi
+	}
+	config_load wireless
+	config_foreach cb_find_ap wifi-iface
+	echo "$ifaces"
+}
+
+reload_wireless_and_hostapd() {
+	# 1. Trigger netifd to re-read /etc/config/wireless and regenerate hostapd configs & maclists
+	wifi reload >/dev/null 2>&1 || ubus call network reload >/dev/null 2>&1
+	sleep 1
+
+	# 2. Tell every active hostapd instance to reload its ACL rules
+	for hapd in $(ubus list | grep -E '^hostapd\.'); do
+		ubus call "$hapd" reload >/dev/null 2>&1
+	done
+}
+
+case "$1" in
+"list")
+	json_init
+	json_add_object "get_status"
+	json_close_object
+	json_add_object "validate_maclist"
+		json_add_string "content" "content"
+		json_add_string "filepath" "filepath"
+	json_close_object
+	json_add_object "apply_macfilter"
+		json_add_string "mode" "mode"
+		json_add_string "action" "action"
+		json_add_array "macs"
+		json_close_array
+		json_add_string "filename" "filename"
+	json_close_object
+	json_add_object "restore_backup"
+	json_close_object
+	json_dump
+	json_cleanup
+	;;
+
+"call")
+	case "$2" in
+	"get_status")
+		config_load wireless
+		ap_ifaces=$(get_ap_ifaces)
+		
+		# Read persistent metadata
+		global_mode=""
+		last_applied=""
+		last_status=""
+		last_filename=""
+		total_stored=0
+		
+		if [ -f /etc/config/macfilter ]; then
+			global_mode=$(uci -q get macfilter.global.mode)
+			last_applied=$(uci -q get macfilter.global.last_applied)
+			last_status=$(uci -q get macfilter.global.last_status)
+			last_filename=$(uci -q get macfilter.global.filename)
+		fi
+
+		# If not set in macfilter config, check first AP iface
+		first_ap=$(echo "$ap_ifaces" | awk '{print $1}')
+		if [ -n "$first_ap" ] && [ -z "$global_mode" ]; then
+			global_mode=$(uci -q get wireless."$first_ap".macfilter)
+		fi
+		[ -z "$global_mode" ] && global_mode="disabled"
+		[ "$global_mode" = "disable" ] && global_mode="disabled"
+
+		json_init
+		json_add_string "mode" "$global_mode"
+		json_add_string "last_applied" "${last_applied:-Never}"
+		json_add_string "last_status" "${last_status:-Ready}"
+		json_add_string "filename" "${last_filename:-None}"
+
+		# Check /tmp/maclist.txt
+		if [ -f "$UPLOAD_FILE" ]; then
+			json_add_boolean "has_upload_file" 1
+			fsize=$(wc -c < "$UPLOAD_FILE" 2>/dev/null || echo 0)
+			json_add_int "upload_file_size" "$fsize"
+		else
+			json_add_boolean "has_upload_file" 0
+			json_add_int "upload_file_size" 0
+		fi
+
+		# Read current active MACs from first AP iface or macfilter config
+		json_add_array "active_macs"
+		seen_macs=""
+		if [ -f /etc/config/macfilter ] && [ -n "$(uci -q get macfilter.global.maclist)" ]; then
+			for mac in $(uci -q get macfilter.global.maclist); do
+				nmac=$(normalize_mac "$mac")
+				if [ -n "$nmac" ]; then
+					json_add_string "" "$nmac"
+					seen_macs="$seen_macs $nmac"
+					total_stored=$((total_stored + 1))
+				fi
+			done
+		elif [ -n "$first_ap" ]; then
+			for mac in $(uci -q get wireless."$first_ap".maclist); do
+				nmac=$(normalize_mac "$mac")
+				if [ -n "$nmac" ]; then
+					json_add_string "" "$nmac"
+					seen_macs="$seen_macs $nmac"
+					total_stored=$((total_stored + 1))
+				fi
+			done
+		fi
+		json_close_array
+		json_add_int "total_macs" "$total_stored"
+
+		# Networks list
+		json_add_array "networks"
+		net_count=0
+		for iface in $ap_ifaces; do
+			ssid=$(uci -q get wireless."$iface".ssid)
+			device=$(uci -q get wireless."$iface".device)
+			mode=$(uci -q get wireless."$iface".mode)
+			filter=$(uci -q get wireless."$iface".macfilter)
+			[ -z "$filter" ] && filter="disabled"
+
+			json_add_object ""
+				json_add_string "id" "$iface"
+				json_add_string "device" "${device:-unknown}"
+				json_add_string "ssid" "${ssid:-OpenWrt}"
+				json_add_string "mode" "${mode:-ap}"
+				json_add_string "macfilter" "$filter"
+			json_close_object
+			net_count=$((net_count + 1))
+		done
+		json_close_array
+		json_add_int "networks_count" "$net_count"
+
+		# Backup available?
+		if [ -f "$BACKUP_FILE" ]; then
+			json_add_boolean "has_backup" 1
+		else
+			json_add_boolean "has_backup" 0
+		fi
+
+		json_dump
+		json_cleanup
+		;;
+
+	"validate_maclist")
+		read -r input
+		json_load "$input"
+		json_get_var raw_content "content"
+		json_get_var file_path "filepath"
+		json_cleanup
+
+		tmp_src="/tmp/macfilter_val_$$.tmp"
+		if [ -n "$file_path" ] && [ -f "$file_path" ]; then
+			cp "$file_path" "$tmp_src"
+		elif [ -n "$raw_content" ]; then
+			printf "%s\n" "$raw_content" > "$tmp_src"
+		elif [ -f "$UPLOAD_FILE" ]; then
+			cp "$UPLOAD_FILE" "$tmp_src"
+		else
+			json_init
+			json_add_boolean "valid" 0
+			json_add_string "error" "No content or file provided for validation"
+			json_dump
+			json_cleanup
+			exit 0
+		fi
+
+		valid=1
+		line_no=0
+		total_valid=0
+		dups_count=0
+		seen_list=""
+		valid_list=""
+
+		json_init
+		json_add_array "errors"
+
+		while IFS= read -r line || [ -n "$line" ]; do
+			line_no=$((line_no + 1))
+			
+			# Trim whitespace
+			trimmed=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/\r//g')
+			
+			# Ignore empty lines or comments
+			[ -z "$trimmed" ] && continue
+			case "$trimmed" in "#"*) continue ;; esac
+
+			norm=$(normalize_mac "$trimmed")
+			if is_valid_mac "$norm"; then
+				# Check duplicate
+				case " $seen_list " in
+					*" $norm "*)
+						dups_count=$((dups_count + 1))
+						;;
+					*)
+						seen_list="$seen_list $norm"
+						valid_list="$valid_list $norm"
+						total_valid=$((total_valid + 1))
+						;;
+				esac
+			else
+				valid=0
+				json_add_object ""
+					json_add_int "line" "$line_no"
+					json_add_string "value" "$trimmed"
+					json_add_string "error" "Malformed MAC address (expected format: AA:BB:CC:DD:EE:FF)"
+				json_close_object
+			fi
+		done < "$tmp_src"
+		json_close_array
+
+		rm -f "$tmp_src"
+
+		json_add_boolean "valid" "$valid"
+		json_add_int "total_lines" "$line_no"
+		json_add_int "valid_count" "$total_valid"
+		json_add_int "duplicates_removed" "$dups_count"
+
+		if [ "$valid" -eq 1 ]; then
+			# Write normalized valid entries to UPLOAD_FILE
+			: > "$UPLOAD_FILE"
+			json_add_array "macs"
+			for m in $valid_list; do
+				echo "$m" >> "$UPLOAD_FILE"
+				json_add_string "" "$m"
+			done
+			json_close_array
+		fi
+
+		json_dump
+		json_cleanup
+		;;
+
+	"apply_macfilter")
+		read -r input
+		json_load "$input"
+		json_get_var req_mode "mode"
+		json_get_var req_action "action"
+		json_get_var req_filename "filename"
+		json_cleanup
+
+		# Normalize mode
+		case "$req_mode" in
+			"allow"|"allowlist"|"whitelist") mode="allow" ;;
+			"deny"|"blocklist"|"blacklist") mode="deny" ;;
+			"disabled"|"disable"|"none"|"") mode="disabled" ;;
+			*)
+				json_init
+				json_add_boolean "success" 0
+				json_add_string "message" "Invalid mode requested: $req_mode"
+				json_dump
+				json_cleanup
+				exit 0
+				;;
+		esac
+
+		[ -z "$req_action" ] && req_action="replace"
+		[ -z "$req_filename" ] && req_filename="maclist.txt"
+
+		# Determine target MACs
+		final_macs=""
+		final_count=0
+
+		if [ "$mode" != "disabled" ]; then
+			# Load existing active MACs if action is 'add'
+			if [ "$req_action" = "add" ]; then
+				if [ -f /etc/config/macfilter ]; then
+					for m in $(uci -q get macfilter.global.maclist); do
+						nm=$(normalize_mac "$m")
+						if is_valid_mac "$nm"; then
+							case " $final_macs " in
+								*" $nm "*) ;;
+								*)
+									final_macs="$final_macs $nm"
+									final_count=$((final_count + 1))
+									;;
+							esac
+						fi
+					done
+				fi
+			fi
+
+			# Read incoming MACs from /tmp/maclist.txt
+			if [ -f "$UPLOAD_FILE" ]; then
+				while IFS= read -r line || [ -n "$line" ]; do
+					nm=$(normalize_mac "$line")
+					[ -z "$nm" ] && continue
+					if is_valid_mac "$nm"; then
+						case " $final_macs " in
+							*" $nm "*) ;;
+							*)
+								final_macs="$final_macs $nm"
+								final_count=$((final_count + 1))
+								;;
+						esac
+					else
+						json_init
+						json_add_boolean "success" 0
+						json_add_string "message" "Validation failed: invalid MAC in upload list ($nm)"
+						json_dump
+						json_cleanup
+						exit 0
+					fi
+				done < "$UPLOAD_FILE"
+			fi
+		fi
+
+		# Safety: Create backup of current wireless macfilter configuration
+		ap_ifaces=$(get_ap_ifaces)
+		: > "$BACKUP_FILE"
+		echo "# MAC Filter backup $(date)" >> "$BACKUP_FILE"
+		for iface in $ap_ifaces; do
+			cur_filter=$(uci -q get wireless."$iface".macfilter)
+			echo "wireless.$iface.macfilter=${cur_filter:-disabled}" >> "$BACKUP_FILE"
+			cur_list=$(uci -q get wireless."$iface".maclist)
+			echo "wireless.$iface.maclist=$cur_list" >> "$BACKUP_FILE"
+		done
+		if [ -f /etc/config/macfilter ]; then
+			echo "--- macfilter config ---" >> "$BACKUP_FILE"
+			cat /etc/config/macfilter >> "$BACKUP_FILE"
+		fi
+
+		# Apply to all AP ifaces safely
+		affected_count=0
+		for iface in $ap_ifaces; do
+			# Remove old maclist & macfilter
+			uci -q delete wireless."$iface".maclist
+			uci -q delete wireless."$iface".macfilter
+			
+			if [ "$mode" = "allow" ] || [ "$mode" = "deny" ]; then
+				uci -q set wireless."$iface".macfilter="$mode"
+				for m in $final_macs; do
+					uci -q add_list wireless."$iface".maclist="$m"
+				done
+			fi
+			affected_count=$((affected_count + 1))
+		done
+
+		# Commit wireless
+		if ! uci commit wireless; then
+			json_init
+			json_add_boolean "success" 0
+			json_add_string "message" "Failed to commit UCI changes to wireless configuration."
+			json_dump
+			json_cleanup
+			exit 0
+		fi
+
+		# Save persistent macfilter configuration
+		if [ ! -f /etc/config/macfilter ]; then
+			touch /etc/config/macfilter
+		fi
+		uci -q delete macfilter.global
+		uci -q set macfilter.global=settings
+		uci -q set macfilter.global.mode="${mode:-disabled}"
+		uci -q set macfilter.global.last_applied="$(date '+%Y-%m-%d %H:%M:%S')"
+		uci -q set macfilter.global.last_status="success"
+		uci -q set macfilter.global.filename="$req_filename"
+		uci -q set macfilter.global.count="$final_count"
+		uci -q set macfilter.global.affected_networks="$affected_count"
+		
+		for m in $final_macs; do
+			uci -q add_list macfilter.global.maclist="$m"
+		done
+		uci commit macfilter
+
+		# Reload wireless & hostapd instances
+		reload_wireless_and_hostapd
+
+		json_init
+		json_add_boolean "success" 1
+		json_add_string "mode" "$mode"
+		json_add_int "count" "$final_count"
+		json_add_int "affected_networks" "$affected_count"
+		json_add_string "message" "MAC filtering policy successfully applied to $affected_count wireless network(s)."
+		json_dump
+		json_cleanup
+		;;
+
+	"restore_backup")
+		if [ ! -f "$BACKUP_FILE" ]; then
+			json_init
+			json_add_boolean "success" 0
+			json_add_string "message" "No previous backup found to restore."
+			json_dump
+			json_cleanup
+			exit 0
+		fi
+
+		ap_ifaces=$(get_ap_ifaces)
+		for iface in $ap_ifaces; do
+			bf_line=$(grep "^wireless.$iface.macfilter=" "$BACKUP_FILE" | cut -d= -f2)
+			bl_line=$(grep "^wireless.$iface.maclist=" "$BACKUP_FILE" | cut -d= -f2)
+			
+			uci -q delete wireless."$iface".maclist
+			uci -q delete wireless."$iface".macfilter
+			if [ -n "$bf_line" ] && [ "$bf_line" != "disabled" ] && [ "$bf_line" != "disable" ]; then
+				uci -q set wireless."$iface".macfilter="$bf_line"
+			fi
+			for m in $bl_line; do
+				[ -n "$m" ] && uci -q add_list wireless."$iface".maclist="$m"
+			done
+		done
+		uci commit wireless
+
+		uci -q set macfilter.global.mode="restored"
+		uci -q set macfilter.global.last_applied="$(date '+%Y-%m-%d %H:%M:%S')"
+		uci -q set macfilter.global.last_status="restored_from_backup"
+		uci commit macfilter
+
+		reload_wireless_and_hostapd
+
+		json_init
+		json_add_boolean "success" 1
+		json_add_string "message" "Previous MAC filter configuration successfully restored from backup."
+		json_dump
+		json_cleanup
+		;;
+	esac
+	;;
+esac

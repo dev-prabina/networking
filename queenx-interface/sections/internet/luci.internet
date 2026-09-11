@@ -1,0 +1,317 @@
+#!/usr/bin/ucode
+import * as ubus from 'ubus';
+import * as fs from 'fs';
+import * as uci from 'uci';
+
+let u = ubus.connect();
+let cursor = uci.cursor();
+
+function get_internet_status() {
+    let now = time();
+
+    // 1. Board Info
+    let board = (u) ? u.call('system', 'board') : {};
+    let model = board.model || 'primeNet AX6000 Wi-Fi 6 Router';
+    let hostname = board.hostname || 'prabina';
+
+    // 2. Active Uplink / WAN Connection
+    let network_status = (u) ? u.call('network.interface.wan', 'status') : {};
+    let wan6_status = (u) ? u.call('network.interface.wan6', 'status') : {};
+    
+    let is_wan_up = (network_status && network_status.up && network_status['ipv4-address'] && length(network_status['ipv4-address']) > 0) ? true : false;
+    let wan_ip = '';
+    let wan_gateway = '';
+    let wan_dns = [];
+    let wan_proto = network_status ? (network_status.proto || 'dhcp') : 'dhcp';
+    let wan_uptime = 0;
+    let wan_device = '';
+
+    if (is_wan_up) {
+        wan_ip = network_status['ipv4-address'][0].address || '';
+        wan_gateway = network_status.route ? (network_status.route[0]?.nexthop || '') : '';
+        wan_uptime = network_status.uptime || 0;
+        wan_device = network_status.l3_device || network_status.device || 'wan';
+        if (network_status['dns-server']) {
+            wan_dns = network_status['dns-server'];
+        }
+    }
+
+    // Check USB Tethering (usb0 / rndis0)
+    let is_tethering = false;
+    let tether_ip = '';
+    let tether_dev = '';
+    let tether_gw = '';
+    let tether_dns = [];
+
+    let usb_status = (u) ? (u.call('network.interface.tethering', 'status') || u.call('network.interface.usb0', 'status')) : {};
+    if (usb_status && usb_status.up && usb_status['ipv4-address'] && length(usb_status['ipv4-address']) > 0) {
+        is_tethering = true;
+        tether_dev = usb_status.l3_device || 'usb0';
+        tether_ip = usb_status['ipv4-address'][0].address;
+        tether_gw = usb_status.route ? (usb_status.route[0]?.nexthop || '') : '';
+        if (usb_status['dns-server']) tether_dns = usb_status['dns-server'];
+    } else {
+        let p = fs.popen('ip route show default', 'r');
+        let droute = p ? p.read('line') : '';
+        if (p) p.close();
+        if (droute && (index(droute, 'usb0') != -1 || index(droute, 'rndis0') != -1)) {
+            let m = match(droute, /via\s+([0-9\.]+)/);
+            if (m) tether_gw = m[1];
+            let p2 = fs.popen('ip addr show dev usb0 2>/dev/null || ip addr show dev rndis0 2>/dev/null', 'r');
+            let aout = p2 ? p2.read('all') : '';
+            if (p2) p2.close();
+            let m2 = match(aout, /inet\s+([0-9\.]+)/);
+            if (m2) {
+                is_tethering = true;
+                tether_ip = m2[1];
+                tether_dev = 'usb0';
+            }
+        }
+    }
+
+    // Check Wi-Fi Repeater (WWAN / STA mode)
+    let is_repeater = false;
+    let repeater_ip = '';
+    let repeater_ssid = '';
+    let wwan_status = (u) ? u.call('network.interface.wwan', 'status') : {};
+    if (wwan_status && wwan_status.up && wwan_status['ipv4-address'] && length(wwan_status['ipv4-address']) > 0) {
+        is_repeater = true;
+        repeater_ip = wwan_status['ipv4-address'][0].address;
+    }
+
+    // Determine Active Source
+    let active_source = 'disconnected';
+    let active_ip = '';
+    let active_gw = '';
+    let active_dns = [];
+    let active_status = 'disconnected';
+    let active_proto = 'DHCP';
+    let active_dev = '';
+    let active_uptime = 0;
+
+    if (is_wan_up && wan_ip) {
+        active_source = 'ethernet';
+        active_ip = wan_ip;
+        active_gw = wan_gateway;
+        active_dns = wan_dns;
+        active_status = 'connected';
+        active_proto = uc(wan_proto);
+        active_dev = wan_device;
+        active_uptime = wan_uptime;
+    } else if (is_tethering && tether_ip) {
+        active_source = 'tethering';
+        active_ip = tether_ip;
+        active_gw = tether_gw;
+        active_dns = tether_dns;
+        active_status = 'connected';
+        active_proto = 'DHCP (USB)';
+        active_dev = tether_dev;
+    } else if (is_repeater && repeater_ip) {
+        active_source = 'repeater';
+        active_ip = repeater_ip;
+        active_status = 'connected';
+        active_proto = 'DHCP (Wi-Fi)';
+    }
+
+    // 3. Client Counts (WLAN vs LAN)
+    let wlan_count = 0;
+    let lan_count = 0;
+    let wifi_macs = {};
+
+    let ap_interfaces = ['phy0-ap0', 'phy1-ap0'];
+    for (let ifname in ap_interfaces) {
+        if (u) {
+            let hapd = u.call('hostapd.' + ifname, 'get_clients');
+            if (hapd && hapd.clients) {
+                for (let mac, c in hapd.clients) {
+                    let lmac = lc(mac);
+                    if (!wifi_macs[lmac]) {
+                        wifi_macs[lmac] = true;
+                        wlan_count++;
+                    }
+                }
+            }
+            let iw = u.call('iwinfo', 'assoclist', { device: ifname });
+            if (iw && iw.results) {
+                for (let st in iw.results) {
+                    let lmac = lc(st.mac);
+                    if (!wifi_macs[lmac]) {
+                        wifi_macs[lmac] = true;
+                        wlan_count++;
+                    }
+                }
+            }
+        }
+    }
+
+    let p_neigh = fs.popen('ip neigh show dev br-lan', 'r');
+    let neigh_out = p_neigh ? p_neigh.read('all') : '';
+    if (p_neigh) p_neigh.close();
+
+    let lines = split(trim(neigh_out || ''), '\n');
+    let lan_macs = {};
+    for (let line in lines) {
+        let parts = split(trim(line), /\s+/);
+        if (length(parts) < 2) continue;
+        let state = parts[length(parts) - 1];
+        let mac = '';
+        for (let i = 1; i < length(parts); i++) {
+            if (parts[i] == 'lladdr' && (i + 1) < length(parts)) {
+                mac = parts[i + 1];
+                break;
+            }
+        }
+        if (mac && (state == 'REACHABLE' || state == 'PERMANENT')) {
+            let lmac = lc(mac);
+            if (!wifi_macs[lmac] && !lan_macs[lmac]) {
+                lan_macs[lmac] = true;
+                lan_count++;
+            }
+        }
+    }
+
+    let has_vpn = (fs.stat('/etc/config/openvpn') || fs.stat('/etc/config/wireguard')) ? true : false;
+    let has_adguard = (fs.stat('/etc/init.d/adguardhome') || fs.stat('/usr/bin/AdGuardHome')) ? true : false;
+    let has_tor = (fs.stat('/etc/init.d/tor') || fs.stat('/usr/sbin/tor')) ? true : false;
+    let has_ipv6 = (wan6_status && wan6_status.up) ? true : false;
+
+    return {
+        timestamp: now,
+        router: {
+            model: "primeNet AX6000",
+            real_model: model,
+            hostname: hostname,
+            brand: "primeNet"
+        },
+        active_connection: {
+            source: active_source,
+            status: active_status,
+            protocol: active_proto,
+            ip_address: active_ip,
+            gateway: active_gw,
+            dns_servers: active_dns,
+            uptime: active_uptime,
+            interface: active_dev
+        },
+        uplinks: {
+            ethernet: {
+                configured: true,
+                connected: is_wan_up,
+                ip: wan_ip,
+                protocol: wan_proto,
+                gateway: wan_gateway,
+                dns: wan_dns,
+                device: wan_device || 'wan'
+            },
+            repeater: {
+                configured: is_repeater,
+                enabled: is_repeater,
+                connected: is_repeater,
+                ssid: repeater_ssid,
+                device: 'wwan',
+                ip: repeater_ip
+            },
+            tethering: {
+                detected: is_tethering,
+                connected: is_tethering,
+                device: tether_dev,
+                ip: tether_ip
+            },
+            cellular: {
+                detected: false,
+                connected: false
+            }
+        },
+        services: {
+            adguard: { installed: has_adguard, active: true },
+            ipv6: { available: true, active: true },
+            vpn: { installed: has_vpn, active: true },
+            tor: { installed: has_tor, active: true },
+            radios: ['5G', '2.4G']
+        },
+        clients: {
+            wlan_count: wlan_count,
+            lan_count: lan_count,
+            total_count: wlan_count + lan_count
+        }
+    };
+}
+
+function test_connectivity() {
+    let ping_res = system('ping -c 2 -W 2 1.1.1.1 >/dev/null 2>&1');
+    let dns_res = system('nslookup google.com >/dev/null 2>&1');
+
+    return {
+        internet_reachable: (ping_res == 0),
+        dns_working: (dns_res == 0),
+        timestamp: time(),
+        message: (ping_res == 0 && dns_res == 0) ? 'Internet connection is active and healthy.' : 'Gateway unreachable or DNS failed.'
+    };
+}
+
+function configure_wan(proto, ipaddr, netmask, gateway, dns, username, password) {
+    if (!cursor) return { success: false, message: 'UCI unavailable' };
+
+    cursor.load('network');
+    cursor.set('network', 'wan', 'proto', proto || 'dhcp');
+
+    if (proto == 'static') {
+        if (ipaddr) cursor.set('network', 'wan', 'ipaddr', ipaddr);
+        if (netmask) cursor.set('network', 'wan', 'netmask', netmask);
+        if (gateway) cursor.set('network', 'wan', 'gateway', gateway);
+        if (dns) {
+            let dns_list = split(dns, /\s+/);
+            cursor.set('network', 'wan', 'dns', dns_list);
+        }
+    } else if (proto == 'pppoe') {
+        if (username) cursor.set('network', 'wan', 'username', username);
+        if (password) cursor.set('network', 'wan', 'password', password);
+    }
+
+    cursor.commit('network');
+    system('/etc/init.d/network restart >/dev/null 2>&1');
+
+    return { success: true, message: 'WAN configuration updated successfully.' };
+}
+
+function scan_wifi() {
+    let res = [];
+    if (u) {
+        let scan_data = u.call('iwinfo', 'scan', { device: 'phy0-ap0' });
+        if (scan_data && scan_data.results) {
+            for (let ap in scan_data.results) {
+                push(res, {
+                    ssid: ap.ssid || '<Hidden SSID>',
+                    bssid: ap.bssid,
+                    channel: ap.channel,
+                    signal: ap.signal,
+                    quality: ap.quality,
+                    encryption: ap.encryption ? (ap.encryption.description || 'Secured') : 'Open'
+                });
+            }
+        }
+    }
+    return { results: res };
+}
+
+let action = ARGV[0];
+let method = ARGV[1];
+
+if (action == 'list') {
+    print('{"get_internet_status": {}, "test_connectivity": {}, "configure_wan": {"proto": "String", "ipaddr": "String", "netmask": "String", "gateway": "String", "dns": "String", "username": "String", "password": "String"}, "scan_wifi": {}}\n');
+} else if (action == 'call' && method == 'get_internet_status') {
+    print(sprintf('%J\n', get_internet_status()));
+} else if (action == 'call' && method == 'test_connectivity') {
+    print(sprintf('%J\n', test_connectivity()));
+} else if (action == 'call' && method == 'configure_wan') {
+    let input = {};
+    let line = fs.readfile('/dev/stdin');
+    if (line) {
+        try { input = json(line); } catch(e) {}
+    }
+    print(sprintf('%J\n', configure_wan(input.proto, input.ipaddr, input.netmask, input.gateway, input.dns, input.username, input.password)));
+} else if (action == 'call' && method == 'scan_wifi') {
+    print(sprintf('%J\n', scan_wifi()));
+} else {
+    print(sprintf('%J\n', get_internet_status()));
+}

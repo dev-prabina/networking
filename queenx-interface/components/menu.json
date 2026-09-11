@@ -1,0 +1,68 @@
+{
+	"admin/queenx": {
+		"title": "Controls",
+		"order": 1,
+		"action": {
+			"type": "firstchild",
+			"preferred": "internet",
+			"recurse": true
+		},
+		"depends": {
+			"acl": [ "luci-app-queenx" ]
+		}
+	},
+
+	"admin/queenx/internet": {
+		"title": "Internet",
+		"order": 1,
+		"action": {
+			"type": "view",
+			"path": "queenx/internet"
+		}
+	},
+
+	"admin/queenx/wireless": {
+		"title": "Wireless",
+		"order": 2,
+		"action": {
+			"type": "view",
+			"path": "queenx/wireless"
+		}
+	},
+
+	"admin/queenx/clients": {
+		"title": "Clients",
+		"order": 3,
+		"action": {
+			"type": "view",
+			"path": "queenx/clients"
+		}
+	},
+
+	"admin/queenx/macfilter": {
+		"title": "MAC Filter",
+		"order": 4,
+		"action": {
+			"type": "view",
+			"path": "queenx/macfilter"
+		}
+	},
+
+	"admin/queenx/dns": {
+		"title": "DNS",
+		"order": 5,
+		"action": {
+			"type": "view",
+			"path": "queenx/dns"
+		}
+	},
+
+	"admin/queenx/loadbalance": {
+		"title": "Load Balancing",
+		"order": 6,
+		"action": {
+			"type": "view",
+			"path": "queenx/loadbalance"
+		}
+	}
+}

@@ -1,0 +1,76 @@
+/* Modern OpenWrt LuCI Mobile Styles */
+@media screen and (max-width: 854px) {
+  header {
+    padding: 0 16px;
+  }
+
+  .header-container {
+    flex-wrap: wrap;
+    padding: 8px 0;
+    gap: 8px;
+  }
+
+  header .brand {
+    font-size: 18px;
+    padding: 4px 10px 4px 0;
+    margin: 0 10px 0 0;
+  }
+
+  .nav {
+    order: 3;
+    width: 100%;
+    overflow-x: auto;
+    padding-bottom: 4px;
+    gap: 2px;
+  }
+
+  .nav > li > a {
+    padding: 5px 10px;
+    font-size: 12.5px;
+  }
+
+  .container, #maincontent {
+    padding: 0 12px 24px;
+  }
+
+  .cbi-map,
+  .cbi-section,
+  .cbi-section-node,
+  .cbi-tblsection {
+    padding: 16px;
+    border-radius: 14px;
+    margin-bottom: 16px;
+  }
+
+  .cbi-value {
+    flex-direction: column;
+    gap: 6px;
+    padding: 10px 0;
+  }
+
+  .cbi-value-title {
+    max-width: 100%;
+    flex: 1 1 100%;
+    padding-top: 0;
+  }
+
+  input[type="text"],
+  input[type="password"],
+  input[type="number"],
+  select,
+  textarea,
+  .cbi-dropdown:not(.btn):not(.cbi-button) {
+    max-width: 100%;
+  }
+
+  .table {
+    display: block;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .footer-inner {
+    flex-direction: column;
+    text-align: center;
+  }
+}

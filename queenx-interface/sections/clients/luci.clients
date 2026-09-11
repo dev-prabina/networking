@@ -1,0 +1,677 @@
+#!/usr/bin/ucode
+import * as ubus from 'ubus';
+import * as fs from 'fs';
+import * as uci from 'uci';
+
+let u = ubus.connect();
+let cursor = uci.cursor();
+
+function get_deleted_macs() {
+    let deleted = {};
+    let raw = fs.readfile('/var/run/luci_deleted_clients.json');
+    if (raw) {
+        try { deleted = json(raw) || {}; } catch(e) {}
+    }
+    return deleted;
+}
+
+function save_deleted_macs(deleted) {
+    fs.writefile('/var/run/luci_deleted_clients.json', sprintf('%J\n', deleted));
+}
+
+function load_traffic_db() {
+    let raw = fs.readfile('/var/run/luci_clients_traffic.json') || fs.readfile('/etc/luci_clients_traffic.json');
+    if (raw) {
+        try { return json(raw) || {}; } catch(e) {}
+    }
+    return {};
+}
+
+function save_traffic_db(db) {
+    fs.writefile('/var/run/luci_clients_traffic.json', sprintf('%J\n', db));
+    fs.writefile('/etc/luci_clients_traffic.json', sprintf('%J\n', db));
+}
+
+function load_checkpoints() {
+    let raw = fs.readfile('/var/run/luci_traffic_checkpoint.json');
+    if (raw) {
+        try { return json(raw) || {}; } catch(e) {}
+    }
+    return {};
+}
+
+function save_checkpoints(cp) {
+    fs.writefile('/var/run/luci_traffic_checkpoint.json', sprintf('%J\n', cp));
+}
+
+function get_conntrack_stats() {
+    let stats = {};
+    let f = fs.open('/proc/net/nf_conntrack', 'r');
+    if (!f) return stats;
+
+    let line;
+    while ((line = f.read('line')) != null) {
+        let m = match(line, /src=([0-9\.]+)\s+dst=([0-9\.]+).*bytes=([0-9]+).*src=([0-9\.]+)\s+dst=([0-9\.]+).*bytes=([0-9]+)/);
+        if (m) {
+            let src1 = m[1], dst1 = m[2], bytes1 = int(m[3]);
+            let src2 = m[4], dst2 = m[6], bytes2 = int(m[6]);
+
+            if (src1 != '127.0.0.1' && substr(src1, 0, 8) == '192.168.') {
+                if (!stats[src1]) stats[src1] = { rx: 0, tx: 0 };
+                stats[src1].tx += bytes1;
+                stats[src1].rx += bytes2;
+            }
+        }
+    }
+    f.close();
+    return stats;
+}
+
+function rebuild_nft_qos() {
+    system("nft 'add table inet luci_qos' 2>/dev/null");
+    system("nft 'flush table inet luci_qos' 2>/dev/null");
+    system("nft 'add chain inet luci_qos forward { type filter hook forward priority -10; policy accept; }' 2>/dev/null");
+
+    let gqos = {};
+    let g_raw = fs.readfile('/var/run/luci_qos_global.json');
+    if (g_raw) {
+        try { gqos = json(g_raw) || {}; } catch(e) {}
+    }
+
+    if (gqos && gqos.enabled) {
+        let down_kbps = (gqos.down_mbps > 0) ? (gqos.down_mbps * 125) : 0;
+        let up_kbps = (gqos.up_mbps > 0) ? (gqos.up_mbps * 125) : 0;
+        let scope = gqos.scope || 'both';
+
+        if (scope == 'both' || scope == 'all') {
+            if (down_kbps > 0) system(sprintf("nft 'add rule inet luci_qos forward ip daddr 192.168.1.0/24 limit rate over %d kbytes/second drop' 2>/dev/null", down_kbps));
+            if (up_kbps > 0) system(sprintf("nft 'add rule inet luci_qos forward ip saddr 192.168.1.0/24 limit rate over %d kbytes/second drop' 2>/dev/null", up_kbps));
+        } else if (scope == 'wifi') {
+            if (down_kbps > 0) system(sprintf("nft 'add rule inet luci_qos forward oifname { \"phy0-ap0\", \"phy1-ap0\" } limit rate over %d kbytes/second drop' 2>/dev/null", down_kbps));
+            if (up_kbps > 0) system(sprintf("nft 'add rule inet luci_qos forward iifname { \"phy0-ap0\", \"phy1-ap0\" } limit rate over %d kbytes/second drop' 2>/dev/null", up_kbps));
+        } else if (scope == 'lan') {
+            if (down_kbps > 0) system(sprintf("nft 'add rule inet luci_qos forward oifname { \"lan1\", \"lan2\", \"lan3\", \"lan4\" } limit rate over %d kbytes/second drop' 2>/dev/null", down_kbps));
+            if (up_kbps > 0) system(sprintf("nft 'add rule inet luci_qos forward iifname { \"lan1\", \"lan2\", \"lan3\", \"lan4\" } limit rate over %d kbytes/second drop' 2>/dev/null", up_kbps));
+        }
+    }
+
+    let qos_limits = {};
+    let qos_raw = fs.readfile('/var/run/luci_qos.json');
+    if (qos_raw) {
+        try { qos_limits = json(qos_raw) || {}; } catch(e) {}
+    }
+
+    for (let k, item in qos_limits) {
+        if (item.ip) {
+            if (item.down_mbps > 0) {
+                let d_kbps = item.down_mbps * 125;
+                system(sprintf("nft 'add rule inet luci_qos forward ip daddr %s limit rate over %d kbytes/second drop' 2>/dev/null", item.ip, d_kbps));
+            }
+            if (item.up_mbps > 0) {
+                let u_kbps = item.up_mbps * 125;
+                system(sprintf("nft 'add rule inet luci_qos forward ip saddr %s limit rate over %d kbytes/second drop' 2>/dev/null", item.ip, u_kbps));
+            }
+        }
+    }
+}
+
+function get_all_clients() {
+    let now = time();
+    let ct_stats = get_conntrack_stats();
+    let deleted_macs = get_deleted_macs();
+    let traffic_db = load_traffic_db();
+    let checkpoints = load_checkpoints();
+
+    // 1. Get Router's own MAC addresses to ignore
+    let router_macs = {};
+    let ifaces = fs.glob('/sys/class/net/*/address');
+    for (let p in ifaces) {
+        let mac = trim(fs.readfile(p) || '');
+        if (mac && length(mac) == 17 && mac != '00:00:00:00:00:00') {
+            router_macs[lc(mac)] = true;
+        }
+    }
+
+    // 2. Gather Host Hints & DHCP Leases
+    let hints = (u) ? u.call('luci-rpc', 'getHostHints') : {};
+    let dhcp_leases = (u) ? u.call('luci-rpc', 'getDHCPLeases') : {};
+    let lease_list = (dhcp_leases && dhcp_leases.dhcp_leases) ? dhcp_leases.dhcp_leases : [];
+
+    let mac_to_ip = {};
+    let mac_to_name = {};
+    let all_known_macs = {};
+
+    for (let l in lease_list) {
+        if (l.macaddr && l.ipaddr) {
+            let lmac = lc(l.macaddr);
+            if (router_macs[lmac] || deleted_macs[lmac]) continue;
+            mac_to_ip[lmac] = l.ipaddr;
+            if (l.hostname) mac_to_name[lmac] = l.hostname;
+            all_known_macs[lmac] = {
+                mac: uc(l.macaddr),
+                ip: l.ipaddr,
+                hostname: l.hostname || '',
+                expires: l.expires || 0
+            };
+        }
+    }
+
+    if (hints) {
+        for (let mac, h in hints) {
+            let lmac = lc(mac);
+            if (router_macs[lmac] || deleted_macs[lmac]) continue;
+            if (h.ipv4 && !mac_to_ip[lmac]) {
+                mac_to_ip[lmac] = h.ipv4;
+            }
+            if (h.name && !mac_to_name[lmac]) {
+                mac_to_name[lmac] = h.name;
+            }
+            if (!all_known_macs[lmac]) {
+                all_known_macs[lmac] = {
+                    mac: uc(mac),
+                    ip: h.ipv4 || '',
+                    hostname: h.name || '',
+                    expires: 0
+                };
+            }
+        }
+    }
+
+    // Also include any previously recorded MACs in traffic_db
+    for (let lmac, t in traffic_db) {
+        if (!router_macs[lmac] && !deleted_macs[lmac] && !all_known_macs[lmac]) {
+            all_known_macs[lmac] = {
+                mac: uc(lmac),
+                ip: t.ip || mac_to_ip[lmac] || '',
+                hostname: t.hostname || mac_to_name[lmac] || '',
+                expires: 0
+            };
+        }
+    }
+
+    // 3. Gather Static DHCP Reservations
+    let reserved_macs = {};
+    if (cursor) {
+        cursor.load('dhcp');
+        cursor.foreach('dhcp', 'host', function(s) {
+            if (s.mac) {
+                let macs = (type(s.mac) == 'array') ? s.mac : split(s.mac, /\s+/);
+                for (let m in macs) {
+                    let lmac = lc(m);
+                    if (router_macs[lmac] || deleted_macs[lmac]) continue;
+                    reserved_macs[lmac] = true;
+                    if (!all_known_macs[lmac]) {
+                        all_known_macs[lmac] = {
+                            mac: uc(m),
+                            ip: s.ip || '',
+                            hostname: s.name || '',
+                            expires: 0
+                        };
+                    }
+                }
+            }
+        });
+    }
+
+    // 4. Gather MAC Filter Blocklist
+    let blocked_macs = {};
+    if (cursor) {
+        cursor.load('macfilter');
+        let mf_mode = cursor.get('macfilter', 'general', 'mode') || 'disabled';
+        if (mf_mode == 'deny') {
+            let maclist = cursor.get('macfilter', 'general', 'maclist') || [];
+            for (let m in maclist) {
+                blocked_macs[lc(m)] = true;
+            }
+        }
+    }
+
+    // 5. Gather QoS Rate Limits & Global QoS
+    let qos_limits = {};
+    let qos_raw = fs.readfile('/var/run/luci_qos.json');
+    if (qos_raw) {
+        try { qos_limits = json(qos_raw) || {}; } catch(e) {}
+    }
+
+    let global_qos = { enabled: false, scope: 'both', down_mbps: 0, up_mbps: 0 };
+    let g_raw = fs.readfile('/var/run/luci_qos_global.json');
+    if (g_raw) {
+        try { global_qos = json(g_raw) || global_qos; } catch(e) {}
+    }
+
+    // 6. Gather Active Wi-Fi Stations from hostapd and iwinfo
+    let online_clients = [];
+    let online_mac_set = {};
+    let wifi_macs = {};
+
+    let ap_interfaces = ['phy0-ap0', 'phy1-ap0'];
+    for (let ifname in ap_interfaces) {
+        let band = (ifname == 'phy1-ap0') ? '5G' : '2.4G';
+        let freq = (ifname == 'phy1-ap0') ? 5180 : 2437;
+        let ssid = (ifname == 'phy1-ap0') ? 'OpenWrt5' : 'OpenWrt';
+
+        if (u) {
+            let hapd = u.call('hostapd.' + ifname, 'get_clients');
+            if (hapd && hapd.clients) {
+                for (let mac, c in hapd.clients) {
+                    let lmac = lc(mac);
+                    if (router_macs[lmac] || online_mac_set[lmac]) continue;
+
+                    if (deleted_macs[lmac]) {
+                        delete deleted_macs[lmac];
+                        save_deleted_macs(deleted_macs);
+                    }
+
+                    online_mac_set[lmac] = true;
+                    wifi_macs[lmac] = true;
+
+                    let ip = mac_to_ip[lmac] || '';
+                    let name = mac_to_name[lmac] || '';
+                    let raw_rx = c.bytes?.rx || (ip && ct_stats[ip] ? ct_stats[ip].rx : 0);
+                    let raw_tx = c.bytes?.tx || (ip && ct_stats[ip] ? ct_stats[ip].tx : 0);
+
+                    // Persistent traffic accumulation
+                    let cp = checkpoints[lmac];
+                    let drx = cp ? ((raw_rx >= cp.rx) ? (raw_rx - cp.rx) : raw_rx) : raw_rx;
+                    let dtx = cp ? ((raw_tx >= cp.tx) ? (raw_tx - cp.tx) : raw_tx) : raw_tx;
+
+                    if (!traffic_db[lmac]) traffic_db[lmac] = { rx_bytes: 0, tx_bytes: 0 };
+                    traffic_db[lmac].rx_bytes += drx;
+                    traffic_db[lmac].tx_bytes += dtx;
+                    traffic_db[lmac].last_seen = now;
+                    if (name) traffic_db[lmac].hostname = name;
+                    if (ip) traffic_db[lmac].ip = ip;
+                    checkpoints[lmac] = { rx: raw_rx, tx: raw_tx };
+
+                    push(online_clients, {
+                        mac: uc(mac),
+                        ip: ip,
+                        hostname: name,
+                        conn_type: 'wifi',
+                        interface: ifname,
+                        ssid: ssid,
+                        radio: band,
+                        frequency: hapd.freq || freq,
+                        signal: c.signal || -50,
+                        noise: -95,
+                        tx_rate_kbps: c.tx_rate ? int(c.tx_rate / 1000) : 0,
+                        rx_rate_kbps: c.rx_rate ? int(c.rx_rate / 1000) : 0,
+                        rx_bytes: traffic_db[lmac].rx_bytes,
+                        tx_bytes: traffic_db[lmac].tx_bytes,
+                        connected_time: c.connected_time || 0,
+                        is_reserved: reserved_macs[lmac] ? true : false,
+                        is_blocked: blocked_macs[lmac] ? true : false,
+                        qos: qos_limits[lmac] || null
+                    });
+                }
+            }
+
+            let iw = u.call('iwinfo', 'assoclist', { device: ifname });
+            if (iw && iw.results) {
+                for (let st in iw.results) {
+                    let lmac = lc(st.mac);
+                    if (router_macs[lmac] || online_mac_set[lmac]) continue;
+                    if (st.inactive && st.inactive > 20000) continue;
+
+                    if (deleted_macs[lmac]) {
+                        delete deleted_macs[lmac];
+                        save_deleted_macs(deleted_macs);
+                    }
+
+                    online_mac_set[lmac] = true;
+                    wifi_macs[lmac] = true;
+
+                    let ip = mac_to_ip[lmac] || '';
+                    let name = mac_to_name[lmac] || '';
+                    let raw_rx = st.rx_bytes || (ip && ct_stats[ip] ? ct_stats[ip].rx : 0);
+                    let raw_tx = st.tx_bytes || (ip && ct_stats[ip] ? ct_stats[ip].tx : 0);
+
+                    let cp = checkpoints[lmac];
+                    let drx = cp ? ((raw_rx >= cp.rx) ? (raw_rx - cp.rx) : raw_rx) : raw_rx;
+                    let dtx = cp ? ((raw_tx >= cp.tx) ? (raw_tx - cp.tx) : raw_tx) : raw_tx;
+
+                    if (!traffic_db[lmac]) traffic_db[lmac] = { rx_bytes: 0, tx_bytes: 0 };
+                    traffic_db[lmac].rx_bytes += drx;
+                    traffic_db[lmac].tx_bytes += dtx;
+                    traffic_db[lmac].last_seen = now;
+                    if (name) traffic_db[lmac].hostname = name;
+                    if (ip) traffic_db[lmac].ip = ip;
+                    checkpoints[lmac] = { rx: raw_rx, tx: raw_tx };
+
+                    push(online_clients, {
+                        mac: uc(st.mac),
+                        ip: ip,
+                        hostname: name,
+                        conn_type: 'wifi',
+                        interface: ifname,
+                        ssid: ssid,
+                        radio: band,
+                        frequency: freq,
+                        signal: st.signal || -50,
+                        noise: st.noise || -95,
+                        tx_rate_kbps: st.tx_rate ? int(st.tx_rate / 1000) : 0,
+                        rx_rate_kbps: st.rx_rate ? int(st.rx_rate / 1000) : 0,
+                        rx_bytes: traffic_db[lmac].rx_bytes,
+                        tx_bytes: traffic_db[lmac].tx_bytes,
+                        connected_time: st.inactive ? int(st.inactive / 1000) : 0,
+                        is_reserved: reserved_macs[lmac] ? true : false,
+                        is_blocked: blocked_macs[lmac] ? true : false,
+                        qos: qos_limits[lmac] || null
+                    });
+                }
+            }
+        }
+    }
+
+    // 7. Gather STRICTLY LIVE REACHABLE Wired LAN Clients from `ip neigh`
+    let p = fs.popen('ip neigh show dev br-lan', 'r');
+    let neigh_text = p ? p.read('all') : '';
+    if (p) p.close();
+
+    let lines = split(trim(neigh_text || ''), '\n');
+    for (let line in lines) {
+        let parts = split(trim(line), /\s+/);
+        if (length(parts) < 2) continue;
+        let state = parts[length(parts) - 1];
+        let ip = parts[0];
+        let mac = '';
+        for (let i = 1; i < length(parts); i++) {
+            if (parts[i] == 'lladdr' && (i + 1) < length(parts)) {
+                mac = parts[i + 1];
+                break;
+            }
+        }
+
+        if (mac && (state == 'REACHABLE' || state == 'PERMANENT')) {
+            let lmac = lc(mac);
+            if (!router_macs[lmac] && !online_mac_set[lmac]) {
+                if (deleted_macs[lmac]) {
+                    delete deleted_macs[lmac];
+                    save_deleted_macs(deleted_macs);
+                }
+
+                online_mac_set[lmac] = true;
+                let name = mac_to_name[lmac] || '';
+                let raw_rx = (ip && ct_stats[ip]) ? ct_stats[ip].rx : 0;
+                let raw_tx = (ip && ct_stats[ip]) ? ct_stats[ip].tx : 0;
+                let is_v4 = (index(ip, '.') != -1);
+                let actual_ip = is_v4 ? ip : (mac_to_ip[lmac] || ip);
+
+                let cp = checkpoints[lmac];
+                let drx = cp ? ((raw_rx >= cp.rx) ? (raw_rx - cp.rx) : raw_rx) : raw_rx;
+                let dtx = cp ? ((raw_tx >= cp.tx) ? (raw_tx - cp.tx) : raw_tx) : raw_tx;
+
+                if (!traffic_db[lmac]) traffic_db[lmac] = { rx_bytes: 0, tx_bytes: 0 };
+                traffic_db[lmac].rx_bytes += drx;
+                traffic_db[lmac].tx_bytes += dtx;
+                traffic_db[lmac].last_seen = now;
+                if (name) traffic_db[lmac].hostname = name;
+                if (actual_ip) traffic_db[lmac].ip = actual_ip;
+                checkpoints[lmac] = { rx: raw_rx, tx: raw_tx };
+
+                push(online_clients, {
+                    mac: uc(mac),
+                    ip: actual_ip,
+                    hostname: name,
+                    conn_type: 'ethernet',
+                    interface: 'br-lan',
+                    ssid: null,
+                    radio: 'Wired',
+                    frequency: null,
+                    signal: null,
+                    noise: null,
+                    tx_rate_kbps: 1000000,
+                    rx_rate_kbps: 1000000,
+                    rx_bytes: traffic_db[lmac].rx_bytes,
+                    tx_bytes: traffic_db[lmac].tx_bytes,
+                    connected_time: 0,
+                    is_reserved: reserved_macs[lmac] ? true : false,
+                    is_blocked: blocked_macs[lmac] ? true : false,
+                    qos: qos_limits[lmac] || null
+                });
+            }
+        }
+    }
+
+    // Save updated traffic DB & checkpoints
+    save_traffic_db(traffic_db);
+    save_checkpoints(checkpoints);
+
+    // 8. Compute OFFLINE Clients (Known devices not in online_mac_set and not in deleted_macs)
+    let offline_clients = [];
+    for (let lmac, dev in all_known_macs) {
+        if (!router_macs[lmac] && !online_mac_set[lmac] && !deleted_macs[lmac]) {
+            let t = traffic_db[lmac] || { rx_bytes: 0, tx_bytes: 0 };
+            push(offline_clients, {
+                mac: dev.mac,
+                ip: dev.ip || mac_to_ip[lmac] || '—',
+                hostname: dev.hostname || mac_to_name[lmac] || (t.hostname ? t.hostname : 'Unknown Device'),
+                rx_bytes: t.rx_bytes || 0,
+                tx_bytes: t.tx_bytes || 0,
+                is_reserved: reserved_macs[lmac] ? true : false,
+                is_blocked: blocked_macs[lmac] ? true : false,
+                qos: qos_limits[lmac] || null
+            });
+        }
+    }
+
+    return {
+        timestamp: now,
+        total_count: length(online_clients),
+        offline_count: length(offline_clients),
+        clients: online_clients,
+        offline_clients: offline_clients,
+        global_qos: global_qos
+    };
+}
+
+function delete_offline_client(mac, ip) {
+    if (!mac) return { success: false, message: 'Missing MAC address' };
+    let lmac = lc(mac);
+
+    // 1. Remove from /tmp/dhcp.leases
+    let leases = fs.readfile('/tmp/dhcp.leases') || '';
+    let new_leases = [];
+    for (let line in split(leases, '\n')) {
+        let parts = split(trim(line), /\s+/);
+        if (length(parts) >= 2 && lc(parts[1]) == lmac) {
+            continue;
+        }
+        if (trim(line) != '') push(new_leases, line);
+    }
+    fs.writefile('/tmp/dhcp.leases', join('\n', new_leases) + '\n');
+
+    // 2. Remove static lease from /etc/config/dhcp if exists
+    if (cursor) {
+        cursor.load('dhcp');
+        let to_del = [];
+        cursor.foreach('dhcp', 'host', function(s) {
+            if (s.mac && lc(s.mac) == lmac) {
+                push(to_del, s['.name']);
+            }
+        });
+        for (let sec in to_del) {
+            cursor.delete('dhcp', sec);
+        }
+        if (length(to_del) > 0) {
+            cursor.commit('dhcp');
+        }
+    }
+
+    // 3. Remove from ip neigh
+    if (ip && ip != '—') {
+        system(sprintf('ip neigh del %s dev br-lan 2>/dev/null', ip));
+    }
+    system(sprintf('ip neigh flush dev br-lan to %s 2>/dev/null', mac));
+
+    // 4. Save to deleted cache
+    let deleted = get_deleted_macs();
+    deleted[lmac] = time();
+    save_deleted_macs(deleted);
+
+    // 5. Remove from traffic DB
+    let traffic_db = load_traffic_db();
+    delete traffic_db[lmac];
+    save_traffic_db(traffic_db);
+
+    let checkpoints = load_checkpoints();
+    delete checkpoints[lmac];
+    save_checkpoints(checkpoints);
+
+    // 6. Reload dnsmasq
+    system('killall -HUP dnsmasq 2>/dev/null');
+
+    return { success: true, message: 'Deleted record for ' + mac };
+}
+
+function clear_all_offline_clients() {
+    let data = get_all_clients();
+    let off = data.offline_clients || [];
+    let count = 0;
+
+    for (let c in off) {
+        if (c.mac) {
+            delete_offline_client(c.mac, c.ip);
+            count++;
+        }
+    }
+
+    return { success: true, count: count, message: sprintf('Cleared all %d offline client records.', count) };
+}
+
+function toggle_reserved_ip(mac, ip, name) {
+    if (!mac || !ip) return { success: false, message: 'Missing MAC or IP' };
+    if (!cursor) return { success: false, message: 'UCI unavailable' };
+
+    let lmac = lc(mac);
+    cursor.load('dhcp');
+
+    let found_sec = null;
+    cursor.foreach('dhcp', 'host', function(s) {
+        if (s.mac && lc(s.mac) == lmac) {
+            found_sec = s['.name'];
+        }
+    });
+
+    if (found_sec) {
+        cursor.delete('dhcp', found_sec);
+        cursor.commit('dhcp');
+        system('/etc/init.d/dnsmasq reload >/dev/null 2>&1');
+        return { success: true, reserved: false, message: 'Static DHCP lease removed for ' + mac };
+    } else {
+        let sec = cursor.add('dhcp', 'host');
+        cursor.set('dhcp', sec, 'mac', mac);
+        cursor.set('dhcp', sec, 'ip', ip);
+        if (name) cursor.set('dhcp', sec, 'name', name);
+        cursor.commit('dhcp');
+        system('/etc/init.d/dnsmasq reload >/dev/null 2>&1');
+        return { success: true, reserved: true, message: 'Static DHCP lease created: ' + ip + ' -> ' + mac };
+    }
+}
+
+function set_speed_limit(mac, ip, down_mbps, up_mbps) {
+    if (!mac || !ip) return { success: false, message: 'Missing MAC or IP address' };
+
+    let lmac = lc(mac);
+    let down = int(down_mbps);
+    let up = int(up_mbps);
+
+    let qos_limits = {};
+    let qos_raw = fs.readfile('/var/run/luci_qos.json');
+    if (qos_raw) {
+        try { qos_limits = json(qos_raw) || {}; } catch(e) {}
+    }
+
+    if (down <= 0 && up <= 0) {
+        delete qos_limits[lmac];
+    } else {
+        qos_limits[lmac] = {
+            mac: uc(mac),
+            ip: ip,
+            down_mbps: down,
+            up_mbps: up
+        };
+    }
+
+    fs.writefile('/var/run/luci_qos.json', sprintf('%J\n', qos_limits));
+    rebuild_nft_qos();
+
+    return {
+        success: true,
+        message: (down > 0 || up > 0) ? sprintf('Speed limit applied for %s: ↓ %d Mbps / ↑ %d Mbps', ip, down, up) : sprintf('Speed limit removed for %s', ip)
+    };
+}
+
+function set_global_speed_limit(scope, down_mbps, up_mbps, enabled) {
+    let down = int(down_mbps);
+    let up = int(up_mbps);
+    let is_en = (enabled === true || enabled === 1 || enabled === '1' || enabled === 'true');
+
+    let gqos = {
+        enabled: is_en,
+        scope: scope || 'both',
+        down_mbps: down,
+        up_mbps: up
+    };
+
+    fs.writefile('/var/run/luci_qos_global.json', sprintf('%J\n', gqos));
+    rebuild_nft_qos();
+
+    return {
+        success: true,
+        global_qos: gqos,
+        message: is_en ? sprintf('Global speed limit active on %s (↓ %d Mbps / ↑ %d Mbps)', scope, down, up) : 'Global speed limit disabled.'
+    };
+}
+
+function get_global_speed_limit() {
+    let gqos = { enabled: false, scope: 'both', down_mbps: 0, up_mbps: 0 };
+    let g_raw = fs.readfile('/var/run/luci_qos_global.json');
+    if (g_raw) {
+        try { gqos = json(g_raw) || gqos; } catch(e) {}
+    }
+    return gqos;
+}
+
+let action = ARGV[0];
+let method = ARGV[1];
+
+if (action == 'list') {
+    print('{"get_clients": {}, "toggle_reserved_ip": {"mac": "String", "ip": "String", "name": "String"}, "set_speed_limit": {"mac": "String", "ip": "String", "down_mbps": "Integer", "up_mbps": "Integer"}, "set_global_speed_limit": {"scope": "String", "down_mbps": "Integer", "up_mbps": "Integer", "enabled": "Boolean"}, "get_global_speed_limit": {}, "delete_offline_client": {"mac": "String", "ip": "String"}, "clear_all_offline_clients": {}}\n');
+} else if (action == 'call' && method == 'get_clients') {
+    print(sprintf('%J\n', get_all_clients()));
+} else if (action == 'call' && method == 'toggle_reserved_ip') {
+    let input = {};
+    let line = fs.readfile('/dev/stdin');
+    if (line) {
+        try { input = json(line); } catch(e) {}
+    }
+    print(sprintf('%J\n', toggle_reserved_ip(input.mac, input.ip, input.name)));
+} else if (action == 'call' && method == 'set_speed_limit') {
+    let input = {};
+    let line = fs.readfile('/dev/stdin');
+    if (line) {
+        try { input = json(line); } catch(e) {}
+    }
+    print(sprintf('%J\n', set_speed_limit(input.mac, input.ip, input.down_mbps, input.up_mbps)));
+} else if (action == 'call' && method == 'set_global_speed_limit') {
+    let input = {};
+    let line = fs.readfile('/dev/stdin');
+    if (line) {
+        try { input = json(line); } catch(e) {}
+    }
+    print(sprintf('%J\n', set_global_speed_limit(input.scope, input.down_mbps, input.up_mbps, input.enabled)));
+} else if (action == 'call' && method == 'get_global_speed_limit') {
+    print(sprintf('%J\n', get_global_speed_limit()));
+} else if (action == 'call' && method == 'delete_offline_client') {
+    let input = {};
+    let line = fs.readfile('/dev/stdin');
+    if (line) {
+        try { input = json(line); } catch(e) {}
+    }
+    print(sprintf('%J\n', delete_offline_client(input.mac, input.ip)));
+} else if (action == 'call' && method == 'clear_all_offline_clients') {
+    print(sprintf('%J\n', clear_all_offline_clients()));
+} else {
+    print(sprintf('%J\n', get_all_clients()));
+}

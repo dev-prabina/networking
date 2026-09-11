@@ -1,0 +1,26 @@
+# OS metadata
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files & logs
+*.log
+*.tmp
+*.bak
+*.swp
+*~
+
+# LuCI Cache
+luci-indexcache*
+luci-modulecache*
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Local secrets & environment overrides
+.env
+local_settings.json
+credentials.txt
+*.key
+*.pem

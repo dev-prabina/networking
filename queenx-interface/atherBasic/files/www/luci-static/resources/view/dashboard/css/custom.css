@@ -1,0 +1,234 @@
+/* Modern OpenWrt Dashboard Styles - Emerald Redesign */
+.Dashboard {
+  color: var(--text-color-high) !important;
+}
+
+.Dashboard .section-content {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+  gap: 24px;
+  padding: 10px 0 20px;
+}
+
+.Dashboard .dashboard-bg {
+  border-radius: 20px;
+  background: var(--card-bg);
+  border: 1px solid var(--card-border);
+  box-shadow: var(--card-shadow);
+  padding: 26px;
+  transition: box-shadow 0.2s ease, transform 0.2s ease;
+  min-height: 440px;
+  display: flex;
+  flex-direction: column;
+}
+
+.Dashboard .dashboard-bg:hover {
+  box-shadow: var(--card-hover-shadow);
+  border-color: rgba(16, 185, 129, 0.35);
+  transform: translateY(-2px);
+}
+
+[data-darkmode="true"] .Dashboard .dashboard-bg:hover {
+  border-color: rgba(52, 211, 153, 0.35);
+}
+
+/* Icon & Title Container */
+.Dashboard .title {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  margin-bottom: 8px;
+}
+
+.Dashboard .title img {
+  background: rgba(16, 185, 129, 0.12);
+  border: 1px solid rgba(16, 185, 129, 0.25);
+  border-radius: 50%;
+  padding: 12px;
+  width: 66px !important;
+  height: 66px !important;
+  margin-bottom: 10px;
+  box-sizing: border-box;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+[data-darkmode="true"] .Dashboard .title img {
+  background: rgba(16, 185, 129, 0.18);
+  border-color: rgba(52, 211, 153, 0.35);
+}
+
+.Dashboard .title img:hover {
+  transform: scale(1.06);
+  box-shadow: 0 0 16px rgba(16, 185, 129, 0.3);
+}
+
+.Dashboard .title h3 {
+  color: #059669;
+  font-size: 19px;
+  font-weight: 700;
+  margin: 4px 0 0;
+  letter-spacing: -0.3px;
+}
+
+[data-darkmode="true"] .Dashboard .title h3 {
+  color: #34d399;
+}
+
+/* Dividers */
+.Dashboard hr {
+  border: 0;
+  border-top: 1px solid rgba(16, 185, 129, 0.15);
+  margin: 12px 0 18px;
+}
+
+[data-darkmode="true"] .Dashboard hr {
+  border-top-color: rgba(52, 211, 153, 0.15);
+}
+
+/* Settings Info Columns */
+.Dashboard .section-content .internet-status-info .settings-info,
+.Dashboard .router-status-wifi .wifi-info .settings-info {
+  display: flex;
+  justify-content: space-around;
+  gap: 20px;
+}
+
+.Dashboard .section-content .internet-status-info .settings-info > div,
+.Dashboard .router-status-wifi .wifi-info .settings-info > div {
+  flex: 1;
+}
+
+.Dashboard .settings-info p {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin: 9px 0;
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+
+.Dashboard .settings-info p span:first-child {
+  font-weight: 600;
+  color: #047857;
+  text-align: left;
+  min-width: 110px;
+}
+
+[data-darkmode="true"] .Dashboard .settings-info p span:first-child {
+  color: #6ee7b7;
+}
+
+.Dashboard .settings-info p span:nth-child(2) {
+  color: var(--text-color-high);
+  font-weight: 500;
+  text-align: right;
+  word-break: break-all;
+}
+
+/* First headings in internet sections */
+.Dashboard .internet-status-self .settings-info p:first-child span:first-child {
+  font-size: 14px;
+  font-weight: 700;
+  color: #047857;
+}
+
+[data-darkmode="true"] .Dashboard .internet-status-self .settings-info p:first-child span:first-child {
+  color: #34d399;
+}
+
+/* Status Labels */
+.Dashboard .label-success,
+.Dashboard .label.label-success {
+  background: rgba(16, 185, 129, 0.15) !important;
+  color: #047857 !important;
+  font-weight: 700 !important;
+  border-radius: 12px !important;
+  padding: 2px 10px !important;
+  font-size: 11px !important;
+  letter-spacing: 0.5px !important;
+  border: 1px solid rgba(16, 185, 129, 0.3) !important;
+  text-transform: uppercase !important;
+  display: inline-block !important;
+}
+
+[data-darkmode="true"] .Dashboard .label-success,
+[data-darkmode="true"] .Dashboard .label.label-success {
+  background: rgba(16, 185, 129, 0.25) !important;
+  color: #6ee7b7 !important;
+  border-color: rgba(52, 211, 153, 0.4) !important;
+}
+
+.Dashboard .label-danger,
+.Dashboard .label.label-danger {
+  background: rgba(239, 68, 68, 0.12) !important;
+  color: #991b1b !important;
+  font-weight: 700 !important;
+  border-radius: 12px !important;
+  padding: 2px 10px !important;
+  font-size: 11px !important;
+  letter-spacing: 0.5px !important;
+  border: 1px solid rgba(239, 68, 68, 0.3) !important;
+  text-transform: uppercase !important;
+  display: inline-block !important;
+}
+
+[data-darkmode="true"] .Dashboard .label-danger,
+[data-darkmode="true"] .Dashboard .label.label-danger {
+  background: rgba(239, 68, 68, 0.22) !important;
+  color: #fca5a5 !important;
+  border-color: rgba(239, 68, 68, 0.4) !important;
+}
+
+/* Devices Table */
+.Dashboard .devices-list .table,
+.Dashboard .devices-info {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  border: none;
+  background: transparent;
+}
+
+.Dashboard .devices-list .table th,
+.Dashboard .devices-info .th {
+  color: #047857;
+  font-weight: 700;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  border-bottom: 1px solid rgba(16, 185, 129, 0.2);
+  padding: 10px 8px;
+  background: transparent;
+}
+
+[data-darkmode="true"] .Dashboard .devices-list .table th,
+[data-darkmode="true"] .Dashboard .devices-info .th {
+  color: #6ee7b7;
+  border-bottom-color: rgba(52, 211, 153, 0.2);
+}
+
+.Dashboard .devices-info .tr .td {
+  padding: 10px 8px;
+  border-bottom: 1px solid rgba(16, 185, 129, 0.08);
+  font-size: 13px;
+  color: var(--text-color-high);
+}
+
+[data-darkmode="true"] .Dashboard .devices-info .tr .td {
+  border-bottom-color: rgba(52, 211, 153, 0.08);
+}
+
+/* Responsive Rules for Dashboard */
+@media screen and (max-width: 860px) {
+  .Dashboard .section-content {
+    grid-template-columns: 1fr;
+  }
+  
+  .Dashboard .section-content .internet-status-info .settings-info,
+  .Dashboard .router-status-wifi .wifi-info .settings-info {
+    flex-direction: column;
+    gap: 10px;
+  }
+}

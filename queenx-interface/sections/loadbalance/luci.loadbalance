@@ -1,0 +1,602 @@
+#!/usr/bin/ucode
+import * as ubus from 'ubus';
+import * as fs from 'fs';
+import * as uci from 'uci';
+
+let u = ubus.connect();
+let cursor = uci.cursor();
+
+let USAGE_FILE = '/etc/loadbalance_usage.json';
+let RATES_FILE = '/tmp/wan_rates_state.json';
+
+function get_port_status(dev) {
+    let carr_p = '/sys/class/net/' + dev + '/carrier';
+    let sp_p = '/sys/class/net/' + dev + '/speed';
+    let dup_p = '/sys/class/net/' + dev + '/duplex';
+
+    let carrier = fs.readfile(carr_p);
+    let speed = fs.readfile(sp_p);
+    let duplex = fs.readfile(dup_p);
+
+    let is_up = (carrier && trim(carrier) == '1');
+    let sp_num = speed ? int(trim(speed)) : 0;
+
+    return {
+        device: dev,
+        link: is_up,
+        speed: (sp_num > 0) ? sprintf('%d Mbps', sp_num) : (is_up ? 'Connected' : 'Disconnected'),
+        duplex: duplex ? trim(duplex) : 'unknown'
+    };
+}
+
+function get_iface_info(ifname) {
+    if (!u) return null;
+    let s = u.call('network.interface.' + ifname, 'status');
+    if (!s) return null;
+
+    let ip = null;
+    if (s['ipv4-address'] && length(s['ipv4-address']) > 0) {
+        ip = s['ipv4-address'][0].address;
+    }
+    let gw = null;
+    if (s.route && length(s.route) > 0) {
+        for (let r in s.route) {
+            if (r.target == '0.0.0.0' && r.nexthop) {
+                gw = r.nexthop;
+                break;
+            }
+        }
+    }
+    let dns = s['dns-server'] || [];
+
+    return {
+        up: (s.up == true),
+        device: s.l3_device || s.device || ifname,
+        proto: s.proto || 'dhcp',
+        ip: ip,
+        gateway: gw,
+        dns: dns
+    };
+}
+
+function get_kernel_raw_bytes(dev) {
+    let rx_p = '/sys/class/net/' + dev + '/statistics/rx_bytes';
+    let tx_p = '/sys/class/net/' + dev + '/statistics/tx_bytes';
+    let rx_str = fs.readfile(rx_p);
+    let tx_str = fs.readfile(tx_p);
+    return {
+        rx: rx_str ? int(trim(rx_str)) : 0,
+        tx: tx_str ? int(trim(tx_str)) : 0
+    };
+}
+
+function save_persistent_usage(usage_data) {
+    usage_data.last_sync = time();
+    fs.writefile('/etc/loadbalance_usage.tmp', sprintf('%J\n', usage_data));
+    fs.rename('/etc/loadbalance_usage.tmp', USAGE_FILE);
+}
+
+function load_persistent_usage() {
+    let raw = fs.readfile(USAGE_FILE);
+    if (raw) {
+        try {
+            let data = json(raw);
+            if (data && data.wan1 && data.wan2) return data;
+        } catch(e) {}
+    }
+
+    // Default initialization
+    let raw1 = get_kernel_raw_bytes('wan');
+    let raw2 = get_kernel_raw_bytes('lan1');
+    let def = {
+        wan1: { rx_total: 0, tx_total: 0, last_rx: raw1.rx, last_tx: raw1.tx },
+        wan2: { rx_total: 0, tx_total: 0, last_rx: 0, last_tx: 0 },
+        last_sync: time()
+    };
+    save_persistent_usage(def);
+    return def;
+}
+
+function update_accounting(is_dual_wan) {
+    let usage = load_persistent_usage();
+    let now_ts = time();
+
+    // 1. WAN1 Accounting (Always active)
+    let raw1 = get_kernel_raw_bytes('wan');
+    if (usage.wan1.last_rx > 0) {
+        if (raw1.rx >= usage.wan1.last_rx) {
+            usage.wan1.rx_total += (raw1.rx - usage.wan1.last_rx);
+        } else {
+            // Kernel counter reset / reboot detected
+            usage.wan1.rx_total += raw1.rx;
+        }
+    }
+    if (usage.wan1.last_tx > 0) {
+        if (raw1.tx >= usage.wan1.last_tx) {
+            usage.wan1.tx_total += (raw1.tx - usage.wan1.last_tx);
+        } else {
+            usage.wan1.tx_total += raw1.tx;
+        }
+    }
+    usage.wan1.last_rx = raw1.rx;
+    usage.wan1.last_tx = raw1.tx;
+
+    // 2. WAN2 Accounting (Active ONLY when Dual-WAN is enabled)
+    let raw2 = get_kernel_raw_bytes('lan1');
+    if (is_dual_wan) {
+        if (usage.wan2.last_rx > 0) {
+            if (raw2.rx >= usage.wan2.last_rx) {
+                usage.wan2.rx_total += (raw2.rx - usage.wan2.last_rx);
+            } else {
+                usage.wan2.rx_total += raw2.rx;
+            }
+        } else {
+            // Re-established baseline upon Dual-WAN enable
+            usage.wan2.last_rx = raw2.rx;
+        }
+
+        if (usage.wan2.last_tx > 0) {
+            if (raw2.tx >= usage.wan2.last_tx) {
+                usage.wan2.tx_total += (raw2.tx - usage.wan2.last_tx);
+            } else {
+                usage.wan2.tx_total += raw2.tx;
+            }
+        } else {
+            usage.wan2.last_tx = raw2.tx;
+        }
+        usage.wan2.last_rx = raw2.rx;
+        usage.wan2.last_tx = raw2.tx;
+    } else {
+        // Dual-WAN disabled: Preserve historical total, reset baseline to 0
+        usage.wan2.last_rx = 0;
+        usage.wan2.last_tx = 0;
+    }
+
+    save_persistent_usage(usage);
+
+    // 3. Live Speed Calculation (Bytes/sec delta)
+    let rates = { wan1: { rx_rate: 0, tx_rate: 0 }, wan2: { rx_rate: 0, tx_rate: 0 } };
+    let raw_rates = fs.readfile(RATES_FILE);
+    let prev_rates = null;
+    if (raw_rates) {
+        try { prev_rates = json(raw_rates); } catch(e) {}
+    }
+
+    if (prev_rates && prev_rates.ts && (now_ts - prev_rates.ts) > 0) {
+        let dt = now_ts - prev_rates.ts;
+        if (raw1.rx >= prev_rates.w1_rx) rates.wan1.rx_rate = int(((raw1.rx - prev_rates.w1_rx) * 8) / dt);
+        if (raw1.tx >= prev_rates.w1_tx) rates.wan1.tx_rate = int(((raw1.tx - prev_rates.w1_tx) * 8) / dt);
+
+        if (is_dual_wan && prev_rates.is_dual_wan) {
+            if (raw2.rx >= prev_rates.w2_rx) rates.wan2.rx_rate = int(((raw2.rx - prev_rates.w2_rx) * 8) / dt);
+            if (raw2.tx >= prev_rates.w2_tx) rates.wan2.tx_rate = int(((raw2.tx - prev_rates.w2_tx) * 8) / dt);
+        }
+    }
+
+    let cur_rate_state = {
+        ts: now_ts,
+        is_dual_wan: is_dual_wan,
+        w1_rx: raw1.rx,
+        w1_tx: raw1.tx,
+        w2_rx: raw2.rx,
+        w2_tx: raw2.tx
+    };
+    fs.writefile(RATES_FILE, sprintf('%J\n', cur_rate_state));
+
+    return { usage: usage, rates: rates };
+}
+
+function probe_latency(dev, target) {
+    if (!dev || !target) return -1;
+    let p = fs.popen(sprintf('ping -c 1 -W 2 -I %s %s 2>&1', dev, target));
+    if (!p) return -1;
+    let out = p.read('all');
+    p.close();
+    if (!out) return -1;
+    let m = match(out, /time=([0-9\.]+)\s*ms/);
+    if (m && m[1]) return +m[1];
+    return -1;
+}
+
+function get_status() {
+    if (!cursor) return {};
+    cursor.load('loadbalance');
+    cursor.load('mwan3');
+
+    let lb_cfg = cursor.get_all('loadbalance', 'global') || {};
+    let is_enabled = (lb_cfg.enabled == '1');
+
+    let w1_weight = int(lb_cfg.wan1_weight || 50);
+    let w2_weight = int(lb_cfg.wan2_weight || 50);
+    let auto_failover = (lb_cfg.auto_failover != '0');
+    let preferred_wan = lb_cfg.preferred_wan || 'wan1';
+
+    // Update Accounting and Compute Rates
+    let acc = update_accounting(is_enabled);
+    let usage = acc.usage;
+    let rates = acc.rates;
+
+    // 1. Gather WAN1 Info
+    let w1_info = get_iface_info('wan') || get_iface_info('usbwan') || get_iface_info('wwan') || {};
+    let w1_dev = w1_info.device || 'wan';
+    let w1_lat = (w1_info.up && w1_info.ip) ? probe_latency(w1_dev, '1.1.1.1') : -1;
+
+    let wan1_data = {
+        interface: 'wan',
+        device: w1_dev,
+        proto: w1_info.proto || 'dhcp',
+        connected: (w1_info.up == true && w1_info.ip != null),
+        active: true,
+        ip: w1_info.ip || null,
+        gateway: w1_info.gateway || null,
+        dns: w1_info.dns || [],
+        status: (w1_lat > 0) ? 'healthy' : ((w1_info.up && w1_info.ip) ? 'connected' : 'offline'),
+        latency: (w1_lat > 0) ? int(w1_lat) : 0,
+        packet_loss: (w1_lat > 0) ? 0 : ((w1_info.up && w1_info.ip) ? 0 : 100),
+        rx_rate_bps: rates.wan1.rx_rate,
+        tx_rate_bps: rates.wan1.tx_rate,
+        rx_bytes: usage.wan1.rx_total,
+        tx_bytes: usage.wan1.tx_total,
+        total_rx_bytes: usage.wan1.rx_total,
+        total_tx_bytes: usage.wan1.tx_total,
+        total_bytes: usage.wan1.rx_total + usage.wan1.tx_total
+    };
+
+    // 2. Gather WAN2 Info
+    let wan2_data = null;
+    if (is_enabled) {
+        let w2_info = get_iface_info('wan2') || {};
+        let w2_dev = w2_info.device || 'lan1';
+        let w2_lat = (w2_info.up && w2_info.ip) ? probe_latency(w2_dev, '1.1.1.1') : -1;
+
+        wan2_data = {
+            interface: 'wan2',
+            device: w2_dev,
+            proto: w2_info.proto || 'dhcp',
+            connected: (w2_info.up == true && w2_info.ip != null),
+            active: true,
+            ip: w2_info.ip || null,
+            gateway: w2_info.gateway || null,
+            dns: w2_info.dns || [],
+            status: (w2_lat > 0) ? 'healthy' : ((w2_info.up && w2_info.ip) ? 'connected' : 'offline'),
+            latency: (w2_lat > 0) ? int(w2_lat) : 0,
+            packet_loss: (w2_lat > 0) ? 0 : ((w2_info.up && w2_info.ip) ? 0 : 100),
+            rx_rate_bps: rates.wan2.rx_rate,
+            tx_rate_bps: rates.wan2.tx_rate,
+            rx_bytes: usage.wan2.rx_total,
+            tx_bytes: usage.wan2.tx_total,
+            total_rx_bytes: usage.wan2.rx_total,
+            total_tx_bytes: usage.wan2.tx_total,
+            total_bytes: usage.wan2.rx_total + usage.wan2.tx_total
+        };
+    } else {
+        // Dual-WAN Disabled State: Strict Inactive Indicators & Preserved Usage
+        wan2_data = {
+            interface: 'wan2',
+            device: 'lan1',
+            proto: 'lan',
+            connected: false,
+            active: false,
+            ip: null,
+            gateway: null,
+            dns: [],
+            status: 'disabled',
+            latency: 0,
+            packet_loss: 0,
+            rx_rate_bps: null,
+            tx_rate_bps: null,
+            rx_bytes: usage.wan2.rx_total,
+            tx_bytes: usage.wan2.tx_total,
+            total_rx_bytes: usage.wan2.rx_total,
+            total_tx_bytes: usage.wan2.tx_total,
+            total_bytes: usage.wan2.rx_total + usage.wan2.tx_total
+        };
+    }
+
+    // Active policy calculation
+    let active_pol = 'DUAL_WAN_DISABLED';
+    if (is_enabled) {
+        if (wan1_data.connected && wan2_data.connected) {
+            active_pol = sprintf('BALANCED_%d_%d', w1_weight, w2_weight);
+        } else if (wan1_data.connected && !wan2_data.connected) {
+            active_pol = 'FAILOVER_WAN1';
+        } else if (!wan1_data.connected && wan2_data.connected) {
+            active_pol = 'FAILOVER_WAN2';
+        } else {
+            active_pol = 'NO_INTERNET';
+        }
+    }
+
+    return {
+        dual_wan_enabled: is_enabled,
+        wan1: wan1_data,
+        wan2: wan2_data,
+        total_usage: {
+            rx_bytes: wan1_data.rx_bytes + wan2_data.rx_bytes,
+            tx_bytes: wan1_data.tx_bytes + wan2_data.tx_bytes,
+            total_bytes: wan1_data.total_bytes + wan2_data.total_bytes
+        },
+        config: {
+            enabled: is_enabled,
+            mode: lb_cfg.mode || 'balanced',
+            wan1_weight: w1_weight,
+            wan2_weight: w2_weight,
+            auto_failover: auto_failover,
+            preferred_wan: preferred_wan,
+            check_interval: int(lb_cfg.check_interval || 3),
+            check_timeout: int(lb_cfg.check_timeout || 2),
+            failure_threshold: int(lb_cfg.failure_threshold || 3),
+            recovery_threshold: int(lb_cfg.recovery_threshold || 2),
+            check_targets: lb_cfg.check_targets || ['1.1.1.1', '8.8.8.8', '9.9.9.9']
+        },
+        active_policy: active_pol,
+        wan1_port: get_port_status('wan'),
+        wan2_port: get_port_status('lan1'),
+        last_update_ts: time()
+    };
+}
+
+function apply_settings(params) {
+    if (!cursor) return { success: false, message: 'UCI unavailable' };
+
+    let is_enabled = (params.enabled === true || params.enabled === 1 || params.enabled === '1');
+    let mode = params.mode || 'balanced';
+    let w1_weight = int(params.wan1_weight != null ? params.wan1_weight : 50);
+    if (w1_weight < 0) w1_weight = 0;
+    if (w1_weight > 100) w1_weight = 100;
+    let w2_weight = 100 - w1_weight;
+
+    let auto_failover = (params.auto_failover !== false && params.auto_failover !== 0 && params.auto_failover !== '0');
+    let preferred_wan = params.preferred_wan || 'wan1';
+
+    let check_interval = int(params.check_interval || 3);
+    if (check_interval < 1) check_interval = 1;
+    let check_timeout = int(params.check_timeout || 2);
+    if (check_timeout < 1) check_timeout = 1;
+    let failure_threshold = int(params.failure_threshold || 3);
+    if (failure_threshold < 1) failure_threshold = 1;
+    let recovery_threshold = int(params.recovery_threshold || 2);
+    if (recovery_threshold < 1) recovery_threshold = 1;
+
+    let targets = params.check_targets || ['1.1.1.1', '8.8.8.8', '9.9.9.9'];
+
+    try {
+        // 1. Update /etc/config/loadbalance
+        cursor.load('loadbalance');
+        cursor.set('loadbalance', 'global', 'loadbalance');
+        cursor.set('loadbalance', 'global', 'enabled', is_enabled ? '1' : '0');
+        cursor.set('loadbalance', 'global', 'mode', mode);
+        cursor.set('loadbalance', 'global', 'wan1_weight', sprintf('%d', w1_weight));
+        cursor.set('loadbalance', 'global', 'wan2_weight', sprintf('%d', w2_weight));
+        cursor.set('loadbalance', 'global', 'auto_failover', auto_failover ? '1' : '0');
+        cursor.set('loadbalance', 'global', 'preferred_wan', preferred_wan);
+        cursor.set('loadbalance', 'global', 'check_interval', sprintf('%d', check_interval));
+        cursor.set('loadbalance', 'global', 'check_timeout', sprintf('%d', check_timeout));
+        cursor.set('loadbalance', 'global', 'failure_threshold', sprintf('%d', failure_threshold));
+        cursor.set('loadbalance', 'global', 'recovery_threshold', sprintf('%d', recovery_threshold));
+        cursor.set('loadbalance', 'global', 'check_targets', targets);
+        cursor.commit('loadbalance');
+
+        // 2. Physical Port Reassignment (/etc/config/network)
+        cursor.load('network');
+        let br_dev_sec = null;
+        cursor.foreach('network', 'device', function(d) {
+            if (d.name == 'br-lan') br_dev_sec = d['.name'];
+        });
+
+        if (is_enabled) {
+            if (br_dev_sec) {
+                cursor.set('network', br_dev_sec, 'ports', ['lan2', 'lan3', 'lan4']);
+            }
+
+            let wan2_exists = false;
+            cursor.foreach('network', 'interface', function(ifc) {
+                if (ifc['.name'] == 'wan2') wan2_exists = true;
+            });
+
+            if (!wan2_exists) {
+                cursor.set('network', 'wan2', 'interface');
+            }
+            cursor.set('network', 'wan2', 'device', 'lan1');
+            cursor.set('network', 'wan2', 'proto', 'dhcp');
+            cursor.set('network', 'wan2', 'metric', '20');
+            cursor.delete('network', 'wan2', 'disabled');
+
+            cursor.set('network', 'wan', 'metric', '10');
+        } else {
+            if (br_dev_sec) {
+                cursor.set('network', br_dev_sec, 'ports', ['lan1', 'lan2', 'lan3', 'lan4']);
+            }
+            cursor.set('network', 'wan2', 'disabled', '1');
+        }
+        cursor.commit('network');
+
+        // 3. Firewall Zone Update (/etc/config/firewall)
+        cursor.load('firewall');
+        cursor.foreach('firewall', 'zone', function(z) {
+            if (z.name == 'wan') {
+                let nets = z.network || ['wan', 'wan6', 'usbwan', 'wwan'];
+                if (type(nets) == 'string') nets = [nets];
+
+                let new_nets = [];
+                for (let n in nets) {
+                    if (n != 'wan2') push(new_nets, n);
+                }
+                if (is_enabled) {
+                    push(new_nets, 'wan2');
+                }
+                cursor.set('firewall', z['.name'], 'network', new_nets);
+            }
+        });
+        cursor.commit('firewall');
+
+        // 4. Update MWAN3 Configuration (/etc/config/mwan3)
+        cursor.load('mwan3');
+        if (is_enabled) {
+            cursor.set('mwan3', 'wan', 'interface');
+            cursor.set('mwan3', 'wan', 'enabled', '1');
+            cursor.set('mwan3', 'wan', 'family', 'ipv4');
+            cursor.set('mwan3', 'wan', 'track_ip', targets);
+            cursor.set('mwan3', 'wan', 'reliability', '1');
+            cursor.set('mwan3', 'wan', 'count', '1');
+            cursor.set('mwan3', 'wan', 'timeout', sprintf('%d', check_timeout));
+            cursor.set('mwan3', 'wan', 'interval', sprintf('%d', check_interval));
+            cursor.set('mwan3', 'wan', 'down', sprintf('%d', failure_threshold));
+            cursor.set('mwan3', 'wan', 'up', sprintf('%d', recovery_threshold));
+
+            cursor.set('mwan3', 'wan2', 'interface');
+            cursor.set('mwan3', 'wan2', 'enabled', '1');
+            cursor.set('mwan3', 'wan2', 'family', 'ipv4');
+            cursor.set('mwan3', 'wan2', 'track_ip', targets);
+            cursor.set('mwan3', 'wan2', 'reliability', '1');
+            cursor.set('mwan3', 'wan2', 'count', '1');
+            cursor.set('mwan3', 'wan2', 'timeout', sprintf('%d', check_timeout));
+            cursor.set('mwan3', 'wan2', 'interval', sprintf('%d', check_interval));
+            cursor.set('mwan3', 'wan2', 'down', sprintf('%d', failure_threshold));
+            cursor.set('mwan3', 'wan2', 'up', sprintf('%d', recovery_threshold));
+
+            let m1_w = (w1_weight > 0) ? sprintf('%d', w1_weight) : '1';
+            let m2_w = (w2_weight > 0) ? sprintf('%d', w2_weight) : '1';
+
+            cursor.set('mwan3', 'wan_m1', 'member');
+            cursor.set('mwan3', 'wan_m1', 'interface', 'wan');
+            cursor.set('mwan3', 'wan_m1', 'metric', '1');
+            cursor.set('mwan3', 'wan_m1', 'weight', m1_w);
+
+            cursor.set('mwan3', 'wan2_m1', 'member');
+            cursor.set('mwan3', 'wan2_m1', 'interface', 'wan2');
+            cursor.set('mwan3', 'wan2_m1', 'metric', '1');
+            cursor.set('mwan3', 'wan2_m1', 'weight', m2_w);
+
+            cursor.commit('mwan3');
+
+            system('/etc/init.d/network reload >/dev/null 2>&1');
+            system('/etc/init.d/firewall reload >/dev/null 2>&1');
+            system('/etc/init.d/mwan3 enable >/dev/null 2>&1');
+            system('/etc/init.d/mwan3 restart >/dev/null 2>&1');
+        } else {
+            cursor.set('mwan3', 'wan2', 'enabled', '0');
+            cursor.commit('mwan3');
+
+            system('/etc/init.d/network reload >/dev/null 2>&1');
+            system('/etc/init.d/firewall reload >/dev/null 2>&1');
+            system('/etc/init.d/mwan3 stop >/dev/null 2>&1');
+            system('/etc/init.d/mwan3 disable >/dev/null 2>&1');
+        }
+
+        // Sync accounting state
+        update_accounting(is_enabled);
+
+        return {
+            success: true,
+            message: is_enabled ?
+                'Dual-WAN enabled. LAN1 is now functioning as WAN2 with active mwan3 load balancing.' :
+                'Dual-WAN disabled. LAN1 is restored as a local LAN port.'
+        };
+    } catch(e) {
+        return { success: false, message: 'Failed to apply load balancing configuration: ' + e };
+    }
+}
+
+function reset_data_usage() {
+    let raw1 = get_kernel_raw_bytes('wan');
+    let raw2 = get_kernel_raw_bytes('lan1');
+    let reset_data = {
+        wan1: { rx_total: 0, tx_total: 0, last_rx: raw1.rx, last_tx: raw1.tx },
+        wan2: { rx_total: 0, tx_total: 0, last_rx: 0, last_tx: 0 },
+        last_sync: time()
+    };
+    save_persistent_usage(reset_data);
+    fs.unlink(RATES_FILE);
+    return { success: true, message: 'Historical data usage counters have been reset to zero.' };
+}
+
+function run_diagnostics() {
+    let diag = {
+        timestamp: time(),
+        wan1: { link: false, ping: false, latency_ms: 0 },
+        wan2: { link: false, ping: false, latency_ms: 0 },
+        dns: { resolved: false, target: 'openwrt.org' },
+        routing: { rules_active: false, mwan3_running: false },
+        firewall: { nat_active: false }
+    };
+
+    let w1_port = get_port_status('wan');
+    let w2_port = get_port_status('lan1');
+    diag.wan1.link = w1_port.link;
+    diag.wan2.link = w2_port.link;
+
+    let p1 = fs.popen('ping -c 1 -W 2 -I wan 1.1.1.1 2>&1');
+    if (p1) {
+        let out1 = p1.read('all');
+        p1.close();
+        let m1 = match(out1, /time=([0-9\.]+)\s*ms/);
+        if (m1 && m1[1]) {
+            diag.wan1.ping = true;
+            diag.wan1.latency_ms = +m1[1];
+        }
+    }
+
+    let p2 = fs.popen('ping -c 1 -W 2 -I lan1 1.1.1.1 2>&1');
+    if (p2) {
+        let out2 = p2.read('all');
+        p2.close();
+        let m2 = match(out2, /time=([0-9\.]+)\s*ms/);
+        if (m2 && m2[1]) {
+            diag.wan2.ping = true;
+            diag.wan2.latency_ms = +m2[1];
+        }
+    }
+
+    let p_dns = fs.popen('nslookup openwrt.org 2>&1');
+    if (p_dns) {
+        let out_dns = p_dns.read('all');
+        p_dns.close();
+        if (out_dns && index(out_dns, 'Address') != -1) {
+            diag.dns.resolved = true;
+        }
+    }
+
+    let p_mwan = fs.popen('mwan3 status 2>&1');
+    if (p_mwan) {
+        let out_mwan = p_mwan.read('all');
+        p_mwan.close();
+        if (out_mwan && index(out_mwan, 'online') != -1) {
+            diag.routing.mwan3_running = true;
+            diag.routing.rules_active = true;
+        }
+    }
+
+    let p_fw = fs.popen('nft list chain inet fw4 srcnat 2>/dev/null || iptables -t nat -L -v -n 2>/dev/null');
+    if (p_fw) {
+        let out_fw = p_fw.read('all');
+        p_fw.close();
+        if (out_fw && (index(out_fw, 'masquerade') != -1 || index(out_fw, 'MASQUERADE') != -1)) {
+            diag.firewall.nat_active = true;
+        }
+    }
+
+    return diag;
+}
+
+let action = ARGV[0];
+let method = ARGV[1];
+
+if (action == 'list') {
+    print('{"get_status": {}, "apply_settings": {"enabled": true, "mode": "balanced", "wan1_weight": 50, "wan2_weight": 50, "auto_failover": true, "preferred_wan": "wan1", "check_interval": 3, "check_timeout": 2, "failure_threshold": 3, "recovery_threshold": 2, "check_targets": []}, "reset_data_usage": {}, "run_diagnostics": {}}\n');
+} else if (action == 'call' && method == 'get_status') {
+    print(sprintf('%J\n', get_status()));
+} else if (action == 'call' && method == 'apply_settings') {
+    let input = {};
+    let line = fs.readfile('/dev/stdin');
+    if (line) {
+        try { input = json(line); } catch(e) {}
+    }
+    print(sprintf('%J\n', apply_settings(input)));
+} else if (action == 'call' && method == 'reset_data_usage') {
+    print(sprintf('%J\n', reset_data_usage()));
+} else if (action == 'call' && method == 'run_diagnostics') {
+    print(sprintf('%J\n', run_diagnostics()));
+} else {
+    print(sprintf('%J\n', get_status()));
+}

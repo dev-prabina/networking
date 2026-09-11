@@ -1,0 +1,114 @@
+{#
+ Copyright 2008 Steven Barth <steven@midlink.org>
+ Copyright 2012 David Menting <david@nut-bolt.nl>
+ Copyright 2008-2022 Jo-Philipp Wich <jo@mein.io>
+ Licensed to the public under the Apache License 2.0.
+-#}
+
+{%
+	import { getuid, getspnam } from 'luci.core';
+
+	const boardinfo = ubus.call('system', 'board');
+	const darkpref = (theme == 'bootstrap-dark' ? 'true' : (theme == 'bootstrap-light' ? 'false' : null));
+	const asset_ver = '20260820-01';
+
+	http.header('Cache-Control', 'no-cache, no-store, must-revalidate');
+	http.header('Pragma', 'no-cache');
+	http.header('Expires', '0');
+	http.prepare_content('text/html; charset=UTF-8');
+-%}
+
+<!DOCTYPE html>
+<html lang="{{ dispatcher.lang }}" data-darkmode="false">
+	<head>
+		<meta charset="utf-8">
+		<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+		<meta http-equiv="Pragma" content="no-cache">
+		<meta http-equiv="Expires" content="0">
+		<title>{{ striptags(`${boardinfo.hostname ?? '?'}${node ? ` - ${node.title}` : ''}`) }} - LuCI</title>
+		<script>
+			(function() {
+				var savedTheme = localStorage.getItem('luci-theme-mode');
+				var root = document.documentElement;
+
+				function applyTheme(isDark) {
+					root.setAttribute('data-darkmode', isDark ? 'true' : 'false');
+					if (document.body) document.body.setAttribute('data-darkmode', isDark ? 'true' : 'false');
+				}
+
+				// Default to Light mode for all new sessions/devices unless explicitly set to 'dark'
+				if (savedTheme === 'dark') {
+					applyTheme(true);
+				} else {
+					applyTheme(false);
+				}
+
+				window.toggleLuciTheme = function() {
+					var isDark = root.getAttribute('data-darkmode') === 'true';
+					var next = !isDark;
+					applyTheme(next);
+					localStorage.setItem('luci-theme-mode', next ? 'dark' : 'light');
+				};
+			})();
+		</script>
+		<meta name="viewport" content="initial-scale=1.0">
+		<link rel="stylesheet" href="{{ media }}/cascade.css?v={{ asset_ver }}">
+		<link rel="stylesheet" media="only screen and (max-device-width: 854px)" href="{{ media }}/mobile.css?v={{ asset_ver }}" />
+		<link rel="icon" href="{{ media }}/logo_48.png?v={{ asset_ver }}" sizes="48x48">
+		<link rel="icon" href="{{ media }}/logo.svg?v={{ asset_ver }}" sizes="any">
+		{% if (node?.css): %}
+		<link rel="stylesheet" href="{{ resource }}/{{ node.css }}?v={{ asset_ver }}">
+		{% endif %}
+		{% if (css): %}
+		<style title="text/css">{{ css }}</style>
+		{% endif %}
+		<script src="{{ dispatcher.build_url('admin/translations', dispatcher.lang) }}"></script>
+		<script src="{{ resource }}/cbi.js?v={{ version.luciversion }}"></script>
+	</head>
+
+	<body class="lang_{{ dispatcher.lang }} {{ entityencode(striptags(node?.title ?? ''), true) }}" data-page="{{ entityencode(join('-', ctx.request_path), true) }}">
+		{% if (!blank_page): %}
+		<header>
+			<div class="header-container">
+				<a class="brand" href="/">{{ striptags(boardinfo.hostname ?? '?') }}</a>
+				<ul class="nav" id="topmenu" style="display:none"></ul>
+				<div class="header-right-actions">
+					<div id="indicators" class="pull-right"></div>
+					<button id="theme-toggle-btn" class="theme-toggle-btn" type="button" onclick="toggleLuciTheme()" title="Toggle Light / Dark Mode" aria-label="Toggle Light / Dark Mode">
+						<svg class="sun-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>
+						<svg class="moon-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
+					</button>
+				</div>
+			</div>
+		</header>
+
+		<div id="maincontent" class="container">
+			{% if (getuid() == 0 && getspnam('root')?.pwdp === ''): %}
+				<div class="alert-message warning">
+					<h4>{{ _('No password set!') }}</h4>
+					<p>{{ _('There is no password set on this router. Please configure a root password to protect the web interface.') }}</p>
+					{% if (dispatcher.lookup("admin/system/admin")): %}
+					  <div class="right"><a class="btn" href="{{ dispatcher.build_url("admin/system/admin") }}">{{ _('Go to password configuration...') }}</a></div>
+					{% endif %}
+				</div>
+			{% endif %}
+
+			{% if (boardinfo.rootfs_type == "initramfs"): %}
+				<div class="alert-message warning">
+					<h4>{{ _('System running in recovery (initramfs) mode.') }}</h4>
+					<p>{{ _('No changes to settings will be stored and are lost after rebooting. This mode should only be used to install a firmware upgrade') }}</p>
+					{% if (dispatcher.lookup("admin/system/flash")): %}
+					  <div class="right"><a class="btn" href="{{ dispatcher.build_url("admin/system/flash") }}">{{ _('Go to firmware upgrade...') }}</a></div>
+					{% endif %}
+				</div>
+			{% endif %}
+
+			<noscript>
+				<div class="alert-message warning">
+					<h4>{{ _('JavaScript required!') }}</h4>
+					<p>{{ _('You must enable JavaScript in your browser or LuCI will not work properly.') }}</p>
+				</div>
+			</noscript>
+
+			<div id="tabmenu" style="display:none"></div>
+		{% endif %}
