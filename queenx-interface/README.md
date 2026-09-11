@@ -332,8 +332,8 @@ Route: /cgi-bin/luci/admin/queenx/loadbalance
 
 Create and manage custom internet interfaces for load balancing and failover. Load balancing shares traffic across multiple internet connections, while failover automatically switches to another connection when the main connection goes down. Users can also monitor the status of each interface and connection.
 
-![Load Balancer](LoadBalance x FailOver.png)
-![Load Balancer x FailOver](LoadBalance x FailOver2.png)
+![Load Balancer](LoadBalancexFailOver.png)
+![Load Balancer x FailOver](LoadBalancexFailOver2.png)
 
 ### 🖼️ 6. Hardware Asset & Visualizer
 > **Asset Path:** `assets/primenet_router.png`
