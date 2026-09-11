@@ -5,7 +5,7 @@
 set -e
 
 REPO_USER="dev-prabina"
-REPO_NAME="openWRT"
+REPO_NAME="networking"
 REPO_BRANCH="main"
 ALT_BRANCH="master"
 GITHUB_RAW="https://raw.githubusercontent.com/$REPO_USER/$REPO_NAME"
