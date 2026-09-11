@@ -286,7 +286,7 @@ rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache*
 > 
 > Features primeNet AX6000 Hero unit with real-time Ethernet port link-state visualizer, 4-Card Uplink Topology (WAN Ethernet, USB Cellular Tethering, Wi-Fi Repeater WWAN, Cellular Modem), and interactive repeater Wi-Fi scanning wizard.
 
-![Internet Dashboard](dashboard.png)
+![Internet Dashboard](queenx-interface/dashboard.png)
 
 ---
 
@@ -295,7 +295,7 @@ rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache*
 > 
 > 4-Tab independent RF controls (`5 GHz Wi-Fi`, `5 GHz Guest Wi-Fi`, `2.4 GHz Wi-Fi`, `2.4 GHz Guest Wi-Fi`), hardware TX power dropdown (up to 30 dBm / 1000 mW), WPA2/WPA3 security, instant QR-code mobile pairing modal, and client isolation.
 
-![Wireless Controls](wireless.png)
+![Wireless Controls](queenx-interface/wireless.png)
 
 ---
 
@@ -304,7 +304,7 @@ rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache*
 > 
 > Real-time client discovery, live upload/download speed indicators, MAC-persistent cumulative traffic counters (MB/GB), per-client download/upload QoS rate limiting, and offline device history manager with bulk deletion.
 
-![Clients Management](clients.png)
+![Clients Management](/queenx-interface/clients.png)
 
 ---
 
@@ -313,7 +313,7 @@ rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache*
 > 
 > Hardware-level `hostapd` Access Control List management supporting Whitelist (Allow Only) and Blacklist (Block List) modes, quick-add from active DHCP leases, bulk MAC address import, and atomic Wi-Fi ACL reloading.
 
-![MAC Filter](mac_filter.png)
+![MAC Filter](queenx-interface/mac_filter.png)
 
 ---
 
@@ -322,7 +322,7 @@ rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache*
 > 
 > Automatic ISP upstream DNS detection, Manual static resolvers with 1-click presets (Cloudflare, Google, Quad9, AdGuard), DNS Rebinding attack protection, client port 53 DNAT query interception, and local static host records manager.
 
-![DNS Management](dns.png)
+![DNS Management](queenx-interface/dns.png)
 
 ---
 
@@ -332,15 +332,15 @@ Route: /cgi-bin/luci/admin/queenx/loadbalance
 
 Create and manage custom internet interfaces for load balancing and failover. Load balancing shares traffic across multiple internet connections, while failover automatically switches to another connection when the main connection goes down. Users can also monitor the status of each interface and connection.
 
-![Load Balancer](LoadBalance x FailOver.png)
-![Load Balancer x FailOver](LoadBalance x FailOver2.png)
+![Load Balancer](queenx-interface/LoadBalancexFailOver.png)
+![Load Balancer x FailOver](queenx-interface/LoadBalancexFailOver2.png)
 
 ### 🖼️ 6. Hardware Asset & Visualizer
 > **Asset Path:** `assets/primenet_router.png`
 > 
 > Transparent hardware representation of the router used in the Hero visualizer.
 
-![Login Interface](Login.png)
+![Login Interface](queenx-interface/Login.png)
 
 ![primeNet Router Asset](assets/primenet_router.png)
 
