@@ -9,7 +9,7 @@ This guide provides detailed, reproducible installation instructions for deployi
 SSH into your router terminal and paste:
 
 ```sh
-sh -c "$(wget -qO- https://raw.githubusercontent.com/dev-prabina/openWRT/main/scripts/install.sh || curl -sSL https://raw.githubusercontent.com/dev-prabina/openWRT/main/scripts/install.sh)"
+wget -qO- https://raw.githubusercontent.com/dev-prabina/networking/main/queenx-interface/scripts/install.sh | sh
 ```
 
 ---

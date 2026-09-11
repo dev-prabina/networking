@@ -22,7 +22,7 @@ You can install both **Queen** and the **Argon Theme** (with full custom color/w
 SSH into your router terminal and copy-paste this single command (it will install the controls only):
 
 ```sh
-sh -c "$(wget -qO- https://raw.githubusercontent.com/dev-prabina/networking/queenx-interface/main/scripts/install.sh || curl -sSL https://raw.githubusercontent.com/dev-prabina/networking/queenx-interface/main/scripts/install.sh)"
+wget -qO- https://raw.githubusercontent.com/dev-prabina/networking/main/queenx-interface/scripts/install.sh | sh
 ```
 
 > **What this does automatically:**
@@ -46,10 +46,10 @@ ssh root@192.168.1.1
 
 # 2. Clone the repository to /tmp
 cd /tmp
-git clone https://github.com/dev-prabina/openWRT.git
+git clone https://github.com/dev-prabina/networking.git
 
 # 3. Run the installer script
-cd /tmp/openWRT
+cd /tmp/networking/queenx-interface
 sh scripts/install.sh
 ```
 
@@ -104,7 +104,7 @@ scp -r ./Queen/* root@192.168.1.1:/tmp/Queen/
 #### Then on the Router SSH Terminal:
 ```sh
 ssh root@192.168.1.1
-cd /tmp/openWRT
+cd /tmp/networking/queenx-interface
 sh scripts/install.sh
 ```
 
@@ -139,25 +139,25 @@ EOF
 mkdir -p /usr/libexec/rpcd /www/luci-static/resources/view/queenx /usr/share/luci/menu.d /usr/share/rpcd/acl.d /etc/config
 
 # Step 4: Copy backend RPCD plugins
-cp /tmp/openWRT/sections/internet/luci.internet         /usr/libexec/rpcd/luci.internet
-cp /tmp/openWRT/sections/wireless/luci.wireless         /usr/libexec/rpcd/luci.wireless
-cp /tmp/openWRT/sections/clients/luci.clients           /usr/libexec/rpcd/luci.clients
-cp /tmp/openWRT/sections/mac-filter/luci.macfilter     /usr/libexec/rpcd/luci.macfilter
-cp /tmp/openWRT/sections/dns/luci.dns                   /usr/libexec/rpcd/luci.dns
-cp /tmp/openWRT/sections/loadbalance/luci.loadbalance   /usr/libexec/rpcd/luci.loadbalance
+cp /tmp/networking/queenx-interface/sections/internet/luci.internet         /usr/libexec/rpcd/luci.internet
+cp /tmp/networking/queenx-interface/sections/wireless/luci.wireless         /usr/libexec/rpcd/luci.wireless
+cp /tmp/networking/queenx-interface/sections/clients/luci.clients           /usr/libexec/rpcd/luci.clients
+cp /tmp/networking/queenx-interface/sections/mac-filter/luci.macfilter     /usr/libexec/rpcd/luci.macfilter
+cp /tmp/networking/queenx-interface/sections/dns/luci.dns                   /usr/libexec/rpcd/luci.dns
+cp /tmp/networking/queenx-interface/sections/loadbalance/luci.loadbalance   /usr/libexec/rpcd/luci.loadbalance
 
 # Step 5: Copy frontend LuCI views
-cp /tmp/openWRT/sections/internet/internet.js           /www/luci-static/resources/view/queenx/internet.js
-cp /tmp/openWRT/sections/wireless/wireless.js           /www/luci-static/resources/view/queenx/wireless.js
-cp /tmp/openWRT/sections/clients/clients.js             /www/luci-static/resources/view/queenx/clients.js
-cp /tmp/openWRT/sections/mac-filter/macfilter.js       /www/luci-static/resources/view/queenx/macfilter.js
-cp /tmp/openWRT/sections/dns/dns.js                     /www/luci-static/resources/view/queenx/dns.js
-cp /tmp/openWRT/sections/loadbalance/loadbalance.js     /www/luci-static/resources/view/queenx/loadbalance.js
+cp /tmp/networking/queenx-interface/sections/internet/internet.js           /www/luci-static/resources/view/queenx/internet.js
+cp /tmp/networking/queenx-interface/sections/wireless/wireless.js           /www/luci-static/resources/view/queenx/wireless.js
+cp /tmp/networking/queenx-interface/sections/clients/clients.js             /www/luci-static/resources/view/queenx/clients.js
+cp /tmp/networking/queenx-interface/sections/mac-filter/macfilter.js       /www/luci-static/resources/view/queenx/macfilter.js
+cp /tmp/networking/queenx-interface/sections/dns/dns.js                     /www/luci-static/resources/view/queenx/dns.js
+cp /tmp/networking/queenx-interface/sections/loadbalance/loadbalance.js     /www/luci-static/resources/view/queenx/loadbalance.js
 
 # Step 6: Copy menu routes, ACL permissions & assets
-cp /tmp/openWRT/components/menu.json /usr/share/luci/menu.d/luci-app-queenx.json
-cp /tmp/openWRT/components/acl.json  /usr/share/rpcd/acl.d/luci-app-queenx.json
-cp /tmp/openWRT/assets/primenet_router.png /www/luci-static/resources/primenet_router.png
+cp /tmp/networking/queenx-interface/components/menu.json /usr/share/luci/menu.d/luci-app-queenx.json
+cp /tmp/networking/queenx-interface/components/acl.json  /usr/share/rpcd/acl.d/luci-app-queenx.json
+cp /tmp/networking/queenx-interface/assets/primenet_router.png /www/luci-static/resources/primenet_router.png
 
 # Step 7: Set correct system permissions
 chmod 0755 /usr/libexec/rpcd/luci.*
