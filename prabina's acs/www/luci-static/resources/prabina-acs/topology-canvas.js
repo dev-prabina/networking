@@ -342,7 +342,9 @@ window.AcsTopologyCanvas.prototype = {
 
 	setDevices: function(devicesList) {
 		var self = this;
+		var oldNodes = this.nodes || {};
 		this.nodes = {};
+		this.nodeElements = {};
 		this.nodesGroup.innerHTML = '';
 		this.linksGroup.innerHTML = '';
 		this.links = [];
@@ -351,6 +353,7 @@ window.AcsTopologyCanvas.prototype = {
 		devicesList.forEach(function(d) {
 			var isLocal = (d.id === 'local');
 			var isHeader = isLocal || (d.role === 'header');
+			var prev = oldNodes[d.id];
 
 			self.nodes[d.id] = {
 				id: d.id,
@@ -362,10 +365,17 @@ window.AcsTopologyCanvas.prototype = {
 				parent: isHeader ? '' : (d.parent || 'local'),
 				x: (d.x != null) ? d.x : (isLocal ? 450 : 250),
 				y: (d.y != null) ? d.y : (isLocal ? 70 : 260),
-				online: isLocal,
-				rx_formatted: '0 bps',
-				tx_formatted: '0 bps',
-				clients: 0
+				status: prev ? prev.status : (isLocal ? 'online' : 'checking'),
+				online: prev ? prev.online : isLocal,
+				rx_formatted: prev ? prev.rx_formatted : (isLocal ? '0 bps' : '--'),
+				tx_formatted: prev ? prev.tx_formatted : (isLocal ? '0 bps' : '--'),
+				clients: prev ? prev.clients : (isLocal ? 0 : '--'),
+				wan_dev: prev ? prev.wan_dev : '--',
+				wan_rx: prev ? prev.wan_rx : 0,
+				wan_tx: prev ? prev.wan_tx : 0,
+				client_src: prev ? prev.client_src : '--',
+				uptime: prev ? prev.uptime : 0,
+				updated: prev ? prev.updated : 0
 			};
 			if (!isLocal) remoteCount++;
 		});
@@ -381,6 +391,52 @@ window.AcsTopologyCanvas.prototype = {
 
 		// Handle first launch welcome state
 		this.toggleWelcomeState(remoteCount === 0);
+	},
+
+	updateDeviceConfig: function(device) {
+		var self = this;
+		var n = this.nodes[device.id];
+		if (!n) return;
+
+		var isLocal = (device.id === 'local');
+		var isHeader = isLocal || (device.role === 'header');
+
+		n.name = device.name || n.name;
+		n.ip = device.ip || n.ip;
+		n.type = isLocal ? 'header_gateway' : (device.type || n.type);
+		n.role = isHeader ? 'header' : (device.role || n.role);
+		n.parent = (isHeader || isLocal) ? '' : (device.parent || 'local');
+		if (device.x != null) n.x = device.x;
+		if (device.y != null) n.y = device.y;
+
+		// Re-render ONLY this node's SVG group in-place
+		var oldG = this.nodeElements[device.id];
+		if (oldG) {
+			oldG.remove();
+			delete this.nodeElements[device.id];
+		}
+		this.renderNode(n);
+		this.buildLinks();
+	},
+
+	setNodeStatus: function(id, status, statusText) {
+		var n = this.nodes[id];
+		if (!n) return;
+
+		n.status = status;
+		if (status === 'online') n.online = true;
+		else if (status === 'offline') n.online = false;
+
+		var dot = this.container.querySelector('#dot-' + id);
+		var txt = this.container.querySelector('#statustext-' + id);
+
+		if (dot) {
+			dot.setAttribute('class', 'acs-status-dot acs-status-dot-' + status);
+		}
+		if (txt) {
+			txt.setAttribute('class', 'acs-status-text acs-status-text-' + status);
+			txt.textContent = statusText || (status === 'online' ? 'Online' : (status === 'checking' ? 'Checking...' : 'Offline'));
+		}
 	},
 
 	toggleWelcomeState: function(show) {
@@ -422,6 +478,8 @@ window.AcsTopologyCanvas.prototype = {
 		var typeClass = isGateway ? 'header-gateway' : ((node.role === 'header' ? 'header-node ' : '') + (isGlinet ? 'glinet' : 'jio'));
 		var typeLabel = isGateway ? 'HEADER GATEWAY' : (node.role === 'header' ? hwLabel + ' (Header)' : hwLabel);
 		var badgeColor = isGateway ? '#38bdf8' : (node.role === 'header' ? '#f59e0b' : (isGlinet ? '#60a5fa' : '#c084fc'));
+		var statusClass = node.status || (node.online ? 'online' : 'offline');
+		var statusLabel = (statusClass === 'checking') ? 'Checking...' : (node.online ? 'Online' : 'Offline');
 
 		var svgHtml = 
 			// Card background
@@ -433,8 +491,8 @@ window.AcsTopologyCanvas.prototype = {
 			'<text x="10" y="16" font-size="9.5" font-weight="700" fill="' + badgeColor + '" letter-spacing="0.5">' + typeLabel + '</text>' +
 			
 			// Status Indicator dot & text
-			'<circle class="acs-status-dot ' + (node.online ? 'acs-status-dot-online' : 'acs-status-dot-offline') + '" id="dot-' + node.id + '" cx="' + (width - 65) + '" cy="12" r="3.5"/>' +
-			'<text class="acs-status-text ' + (node.online ? 'acs-status-text-online' : 'acs-status-text-offline') + '" id="statustext-' + node.id + '" x="' + (width - 55) + '" y="15">' + (node.online ? 'Online' : 'Offline') + '</text>' +
+			'<circle class="acs-status-dot acs-status-dot-' + statusClass + '" id="dot-' + node.id + '" cx="' + (width - 65) + '" cy="12" r="3.5"/>' +
+			'<text class="acs-status-text acs-status-text-' + statusClass + '" id="statustext-' + node.id + '" x="' + (width - 55) + '" y="15">' + statusLabel + '</text>' +
 			
 			// Device Name
 			'<text class="acs-node-title" x="12" y="44" font-size="13.5" font-weight="700">' + this.escapeHtml(node.name) + '</text>' +
@@ -605,9 +663,10 @@ window.AcsTopologyCanvas.prototype = {
 		Object.keys(statusData.devices).forEach(function(id) {
 			var metric = statusData.devices[id];
 			var n = self.nodes[id];
-			if (!n) return;
+			if (!n || typeof metric !== 'object') return;
 
 			n.online = !!metric.online;
+			n.status = n.online ? 'online' : 'offline';
 			n.rx_formatted = n.online ? (metric.rx_formatted || '0 bps') : '--';
 			n.tx_formatted = n.online ? (metric.tx_formatted || '0 bps') : '--';
 			n.clients = n.online ? (metric.clients != null ? metric.clients : 0) : '--';
@@ -625,10 +684,10 @@ window.AcsTopologyCanvas.prototype = {
 			var uEl = self.container.querySelector('#users-' + id);
 
 			if (dot) {
-				dot.setAttribute('class', 'acs-status-dot ' + (n.online ? 'acs-status-dot-online' : 'acs-status-dot-offline'));
+				dot.setAttribute('class', 'acs-status-dot acs-status-dot-' + n.status);
 			}
 			if (txt) {
-				txt.setAttribute('class', 'acs-status-text ' + (n.online ? 'acs-status-text-online' : 'acs-status-text-offline'));
+				txt.setAttribute('class', 'acs-status-text acs-status-text-' + n.status);
 				txt.textContent = n.online ? 'Online' : 'Offline';
 			}
 			if (rxEl) rxEl.textContent = n.rx_formatted;

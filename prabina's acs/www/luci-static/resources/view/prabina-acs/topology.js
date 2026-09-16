@@ -62,6 +62,8 @@ return view.extend({
 	devices: [],
 	pollInterval: 25,
 	isFullscreen: false,
+	statusGeneration: 0,
+	isStatusPolling: false,
 
 	load: function() {
 		return Promise.all([
@@ -196,11 +198,18 @@ return view.extend({
 		var self = this;
 		poll.add(function() {
 			if (document.hidden) return Promise.resolve();
+			if (self.isStatusPolling) return Promise.resolve();
+			self.isStatusPolling = true;
+			var gen = ++self.statusGeneration;
+
 			return callGetStatus('all', false).then(function(res) {
-				if (self.canvas && res && res.devices) {
+				if (gen === self.statusGeneration && self.canvas && res && res.devices) {
 					self.canvas.updateLiveMetrics(res);
 				}
-			}).catch(function() {});
+			}).catch(function() {
+			}).finally(function() {
+				self.isStatusPolling = false;
+			});
 		}, this.pollInterval);
 	},
 
@@ -212,7 +221,10 @@ return view.extend({
 			btn.textContent = '🔄 Probing...';
 		}
 
+		var gen = ++this.statusGeneration;
+
 		return callGetStatus('all', !!force).then(function(res) {
+			if (gen < self.statusGeneration) return;
 			if (self.canvas && res && res.devices) {
 				self.canvas.updateLiveMetrics(res);
 			}
@@ -223,6 +235,21 @@ return view.extend({
 			if (btn) {
 				btn.disabled = false;
 				btn.textContent = '🔄 Refresh Status';
+			}
+		});
+	},
+
+	refreshSingleDeviceStatus: function(nodeId) {
+		var self = this;
+		var gen = ++this.statusGeneration;
+
+		return callGetStatus(nodeId, true).then(function(res) {
+			if (self.canvas && res && res.devices) {
+				self.canvas.updateLiveMetrics(res);
+			}
+		}).catch(function() {
+			if (self.canvas) {
+				self.canvas.setNodeStatus(nodeId, 'offline');
 			}
 		});
 	},
@@ -555,7 +582,37 @@ return view.extend({
 								if (res && res.success) {
 									backdrop.remove();
 									ui.addNotification(null, E('p', {}, _('Device updated successfully.')), 'info');
-									self.refreshDeviceList();
+
+									var updatedDev = (res.device && res.device.id) ? res.device : {
+										id: node.id,
+										name: name,
+										ip: ip,
+										username: user,
+										type: type,
+										role: role,
+										parent: parent,
+										port: 22,
+										x: nx,
+										y: ny
+									};
+
+									// 1. Update in-memory devices list
+									for (var i = 0; i < self.devices.length; i++) {
+										if (self.devices[i].id === node.id) {
+											Object.assign(self.devices[i], updatedDev);
+											break;
+										}
+									}
+
+									// 2. Update topology canvas configuration without wiping other nodes
+									if (self.canvas) {
+										self.canvas.updateDeviceConfig(updatedDev);
+										// Show Checking... ONLY for the edited router
+										self.canvas.setNodeStatus(node.id, 'checking');
+									}
+
+									// 3. Refresh status ONLY for the edited router
+									self.refreshSingleDeviceStatus(node.id);
 								} else {
 									ui.addNotification(null, E('p', {}, _('Error updating device: ') + (res.error || 'Failed')), 'error');
 								}
@@ -963,7 +1020,7 @@ return view.extend({
 			if (self.canvas) {
 				self.canvas.setDevices(self.devices);
 			}
-			return self.handleRefreshStatus(true);
+			return self.handleRefreshStatus(false);
 		});
 	}
 });

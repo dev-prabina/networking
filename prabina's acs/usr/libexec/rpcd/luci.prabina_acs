@@ -145,8 +145,21 @@ function edit_device(args) {
 		if (args.x) cursor.set('prabina_acs', 'local', 'x', sprintf('%d', int(args.x)));
 		if (args.y) cursor.set('prabina_acs', 'local', 'y', sprintf('%d', int(args.y)));
 		cursor.commit('prabina_acs');
-		try { fs.unlink('/var/run/prabina_acs_cache.json'); } catch(e) {}
-		return { success: true };
+
+		let loc_dev = {
+			id: 'local',
+			name: cursor.get('prabina_acs', 'local', 'name') || get_hostname(),
+			ip: get_tailscale_ip(),
+			username: '',
+			has_password: false,
+			type: 'header_gateway',
+			role: 'header',
+			parent: '',
+			port: 22,
+			x: int(cursor.get('prabina_acs', 'local', 'x') || 450),
+			y: int(cursor.get('prabina_acs', 'local', 'y') || 70)
+		};
+		return { success: true, device: loc_dev };
 	}
 
 	if (args.name && length(trim(args.name)) > 0) {
@@ -188,9 +201,22 @@ function edit_device(args) {
 	cursor.commit('prabina_acs');
 	fs.chmod('/etc/config/prabina_acs', 0600);
 
-	try { fs.unlink('/var/run/prabina_acs_cache.json'); } catch(e) {}
+	// Return updated device without password
+	let updated_dev = {
+		id: id,
+		name: cursor.get('prabina_acs', id, 'name') || id,
+		ip: cursor.get('prabina_acs', id, 'ip') || '',
+		username: cursor.get('prabina_acs', id, 'username') || 'root',
+		has_password: (length(cursor.get('prabina_acs', id, 'password') || '') > 0),
+		type: cursor.get('prabina_acs', id, 'type') || 'jio',
+		role: cursor.get('prabina_acs', id, 'role') || 'child',
+		parent: (cursor.get('prabina_acs', id, 'role') == 'header') ? '' : (cursor.get('prabina_acs', id, 'parent') || 'local'),
+		port: int(cursor.get('prabina_acs', id, 'port') || 22),
+		x: int(cursor.get('prabina_acs', id, 'x') || 250),
+		y: int(cursor.get('prabina_acs', id, 'y') || 250)
+	};
 
-	return { success: true };
+	return { success: true, device: updated_dev };
 }
 
 function delete_device(args) {
@@ -221,9 +247,28 @@ function delete_device(args) {
 	cursor.commit('prabina_acs');
 	fs.chmod('/etc/config/prabina_acs', 0600);
 
-	// Invalidate status cache and clean up rates
+	// Remove deleted device from cache while preserving other routers
 	try {
-		fs.unlink('/var/run/prabina_acs_cache.json');
+		let cache_file = '/var/run/prabina_acs_cache.json';
+		let raw_cache = fs.readfile(cache_file);
+		if (raw_cache) {
+			let lines = split(raw_cache, '\n');
+			let json_str = '';
+			for (let line in lines) {
+				if (index(line, '#') != 0 && length(trim(line)) > 0) json_str += line;
+			}
+			let parsed = json(json_str);
+			if (parsed && parsed.devices && parsed.devices[id]) {
+				delete parsed.devices[id];
+				let tmp_c = cache_file + '.tmp.' + time();
+				fs.writefile(tmp_c, sprintf('#time=%d\n%J\n', parsed.timestamp || time(), parsed));
+				fs.rename(tmp_c, cache_file);
+			}
+		}
+	} catch(e) {}
+
+	try {
+		fs.unlink('/var/run/prabina_acs_rates/' + id);
 	} catch(e) {}
 
 	try {
@@ -238,7 +283,9 @@ function delete_device(args) {
 					push(filtered, line);
 				}
 			}
-			fs.writefile(rate_file, join('\n', filtered) + '\n');
+			let tmp_r = rate_file + '.tmp.' + time();
+			fs.writefile(tmp_r, join('\n', filtered) + '\n');
+			fs.rename(tmp_r, rate_file);
 		}
 	} catch(e) {}
 
@@ -288,16 +335,63 @@ function get_status(args) {
 
 	let cmd = sprintf('/usr/bin/prabina-acs-status "%s" "%s" 2>/dev/null', target, force);
 	let p = fs.popen(cmd);
+	let result = null;
 	if (p) {
 		let raw = p.read('all');
 		p.close();
 		if (raw) {
 			try {
-				let parsed = json(raw);
-				if (parsed) return parsed;
+				result = json(raw);
 			} catch(e) {}
 		}
 	}
+
+	let cache_file = '/var/run/prabina_acs_cache.json';
+
+	// If we got a valid result for a specific target, merge with full cache
+	if (result && result.devices && target != 'all' && target != '') {
+		try {
+			let raw_cache = fs.readfile(cache_file);
+			if (raw_cache) {
+				let lines = split(raw_cache, '\n');
+				let json_str = '';
+				for (let line in lines) {
+					if (index(line, '#') != 0 && length(trim(line)) > 0) json_str += line;
+				}
+				let cached_all = json(json_str);
+				if (cached_all && cached_all.devices) {
+					for (let k, v in result.devices) {
+						cached_all.devices[k] = v;
+					}
+					cached_all.timestamp = result.timestamp || time();
+					let tmp_c = cache_file + '.tmp.' + time();
+					fs.writefile(tmp_c, sprintf('#time=%d\n%J\n', cached_all.timestamp, cached_all));
+					fs.rename(tmp_c, cache_file);
+					return cached_all;
+				}
+			}
+		} catch(e) {}
+		return result;
+	}
+
+	if (result && result.devices && length(keys(result.devices)) > 0) {
+		return result;
+	}
+
+	// Fallback to cache file if status command returned empty
+	try {
+		let raw_cache = fs.readfile(cache_file);
+		if (raw_cache) {
+			let lines = split(raw_cache, '\n');
+			let json_str = '';
+			for (let line in lines) {
+				if (index(line, '#') != 0 && length(trim(line)) > 0) json_str += line;
+			}
+			let cached = json(json_str);
+			if (cached && cached.devices) return cached;
+		}
+	} catch(e) {}
+
 	return { timestamp: time(), devices: {} };
 }
 

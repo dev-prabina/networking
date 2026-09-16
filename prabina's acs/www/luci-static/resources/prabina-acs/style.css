@@ -362,6 +362,11 @@
 	fill: #ef4444;
 }
 
+.acs-status-dot-checking {
+	fill: #f59e0b;
+	animation: acs-pulse 1.6s infinite ease-in-out;
+}
+
 .acs-status-text {
 	font-size: 10.5px;
 	font-weight: 600;
@@ -373,6 +378,15 @@
 
 .acs-status-text-offline {
 	fill: #f87171;
+}
+
+.acs-status-text-checking {
+	fill: #fbbf24;
+}
+
+@keyframes acs-pulse {
+	0%, 100% { opacity: 1; }
+	50% { opacity: 0.35; }
 }
 
 /* SVG Connection Links & Fixed Arrow Alignment */

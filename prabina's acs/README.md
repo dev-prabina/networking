@@ -63,6 +63,15 @@ The topology canvas provides native touch and gesture interaction across all dev
 
 ---
 
+## Status Reliability & Device State Management
+
+Prabina's ACS features an isolated, resilient status-monitoring architecture:
+- **Independent Router Probing**: Probing or editing an individual router never marks other routers as offline. Each device's state is tracked and preserved independently.
+- **Graceful In-Place Updates**: Editing router settings updates the topology canvas directly without destroying cached metrics or DOM nodes. The edited device briefly shows a `Checking...` indicator while a targeted probe runs, while all other routers stay solidly `Online`.
+- **Atomic Cache & Rate Storage**: Router metrics and speed calculations use atomic, per-device file locks in `/var/run/prabina_acs_rates/`, eliminating race conditions between concurrent status queries and background polling.
+
+---
+
 ## MAC Access Control
 
 ![Prabina's ACS MAC Management](screenshots/mac.png)
