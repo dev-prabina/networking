@@ -51,6 +51,18 @@ The topology view lets you arrange your routers visually and see their basic sta
 
 ---
 
+## Mobile & Touch Support
+
+The topology canvas provides native touch and gesture interaction across all devices:
+- **Desktop & Laptop**: Full mouse and touchpad support (drag-and-drop nodes, mouse wheel zoom, click-and-drag pan).
+- **Mobile Phones & Tablets**: Touch interaction on Android, iPhone, and iPad:
+  - Single-finger drag to freely reposition router nodes.
+  - Two-finger pinch-to-zoom and multi-touch canvas panning.
+  - Quick zoom buttons (`+`, `−`, `⊙`) with touch-friendly hit targets.
+  - Zero freeze: dedicated pointer capture and `touch-action: none` prevent page scroll conflicts while interacting with the canvas.
+
+---
+
 ## MAC Access Control
 
 ![Prabina's ACS MAC Management](screenshots/mac.png)

@@ -16,10 +16,15 @@ window.AcsTopologyCanvas = function(containerEl, options) {
 	this.panX = 0;
 	this.panY = 0;
 	this.isPanning = false;
+	this.isPinching = false;
 	this.dragNode = null;
+	this.dragPointerId = null;
 	this.dragOffset = { x: 0, y: 0 };
+	this.dragStartScreen = { x: 0, y: 0 };
 	this.hasMoved = false;
 	this.isDirty = false;
+	this.activePointers = {};
+	this.rafPending = false;
 
 	this.init();
 };
@@ -33,6 +38,10 @@ window.AcsTopologyCanvas.prototype = {
 		this.svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
 		this.svg.setAttribute('class', 'acs-canvas-svg');
 		this.svg.setAttribute('tabindex', '0');
+		this.svg.style.touchAction = 'none';
+		this.svg.style.userSelect = 'none';
+		this.svg.style.webkitUserSelect = 'none';
+		this.container.style.touchAction = 'none';
 
 		// Definitions for gradients & markers
 		var defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
@@ -84,69 +93,208 @@ window.AcsTopologyCanvas.prototype = {
 
 	setupEvents: function() {
 		var self = this;
-		var startX = 0, startY = 0;
+		var panStartX = 0;
+		var panStartY = 0;
+		var pinchStartDist = 0;
+		var pinchStartScale = 1.0;
+		var pinchSvgCenter = { x: 0, y: 0 };
 
-		// Mouse wheel zoom
+		// Desktop mouse wheel zoom
 		this.svg.addEventListener('wheel', function(e) {
 			e.preventDefault();
 			var delta = e.deltaY > 0 ? -0.1 : 0.1;
 			self.zoom(delta, e.clientX, e.clientY);
 		}, { passive: false });
 
-		// Mouse down (start Pan or Node Drag)
-		this.svg.addEventListener('mousedown', function(e) {
-			if (e.button !== 0) return; // only left click
+		// Unified Pointer Down (Mouse, Touch, Pen)
+		this.svg.addEventListener('pointerdown', function(e) {
+			// For mouse, only react to primary button (left click)
+			if (e.pointerType === 'mouse' && e.button !== 0) return;
 
-			var targetNode = e.target.closest('.acs-node-group');
-			if (targetNode) {
-				var nodeId = targetNode.getAttribute('data-id');
-				self.dragNode = self.nodes[nodeId];
-				self.selectedId = nodeId;
-				self.hasMoved = false;
-
-				var pt = self.screenToSvg(e.clientX, e.clientY);
-				self.dragOffset.x = pt.x - self.dragNode.x;
-				self.dragOffset.y = pt.y - self.dragNode.y;
-
-				self.highlightSelected();
-				if (self.options.onSelectNode) self.options.onSelectNode(self.dragNode);
-			} else {
-				self.isPanning = true;
-				startX = e.clientX - self.panX;
-				startY = e.clientY - self.panY;
-				self.svg.classList.add('panning');
+			// If clicked the node action menu trigger (3 dots), let it handle its own click
+			if (e.target && e.target.closest && e.target.closest('.acs-node-action-btn')) {
+				return;
 			}
-		});
 
-		// Mouse move
-		window.addEventListener('mousemove', function(e) {
-			if (self.dragNode) {
-				self.hasMoved = true;
-				var pt = self.screenToSvg(e.clientX, e.clientY);
-				self.dragNode.x = Math.round(pt.x - self.dragOffset.x);
-				self.dragNode.y = Math.round(pt.y - self.dragOffset.y);
-				self.isDirty = true;
-
-				self.updateNodePosition(self.dragNode.id);
-				self.updateLinks();
-			} else if (self.isPanning) {
-				self.panX = e.clientX - startX;
-				self.panY = e.clientY - startY;
-				self.applyTransform();
+			// Prevent touch gestures/scrolling on mobile canvas
+			if (e.pointerType === 'touch') {
+				try { e.preventDefault(); } catch (err) {}
 			}
-		});
 
-		// Mouse up
-		window.addEventListener('mouseup', function() {
-			if (self.dragNode) {
-				if (self.hasMoved && self.options.onNodeMoved) {
-					self.options.onNodeMoved(self.dragNode);
+			self.activePointers[e.pointerId] = {
+				clientX: e.clientX,
+				clientY: e.clientY
+			};
+
+			try {
+				if (self.svg.setPointerCapture) {
+					self.svg.setPointerCapture(e.pointerId);
 				}
+			} catch (err) {}
+
+			var pIds = Object.keys(self.activePointers);
+			var count = pIds.length;
+
+			if (count === 1) {
+				// Single pointer: Check if touching a router node card or canvas background
+				var targetNode = (e.target && e.target.closest) ? e.target.closest('.acs-node-group') : null;
+				if (targetNode) {
+					var nodeId = targetNode.getAttribute('data-id');
+					self.dragNode = self.nodes[nodeId];
+					self.dragPointerId = e.pointerId;
+					self.selectedId = nodeId;
+					self.hasMoved = false;
+
+					var pt = self.screenToSvg(e.clientX, e.clientY);
+					self.dragOffset.x = pt.x - self.dragNode.x;
+					self.dragOffset.y = pt.y - self.dragNode.y;
+					self.dragStartScreen.x = e.clientX;
+					self.dragStartScreen.y = e.clientY;
+
+					self.highlightSelected();
+					if (self.options.onSelectNode) {
+						self.options.onSelectNode(self.dragNode);
+					}
+				} else {
+					// Canvas Pan
+					self.isPanning = true;
+					panStartX = e.clientX - self.panX;
+					panStartY = e.clientY - self.panY;
+					self.svg.classList.add('panning');
+				}
+			} else if (count >= 2) {
+				// Multi-touch: Smooth pinch-to-zoom and two-finger canvas pan
+				// Cancel any single node drag to avoid accidental repositioning while pinching
 				self.dragNode = null;
-			}
-			if (self.isPanning) {
+				self.dragPointerId = null;
 				self.isPanning = false;
 				self.svg.classList.remove('panning');
+				self.isPinching = true;
+
+				var p1 = self.activePointers[pIds[0]];
+				var p2 = self.activePointers[pIds[1]];
+
+				pinchStartDist = Math.hypot(p2.clientX - p1.clientX, p2.clientY - p1.clientY);
+				pinchStartScale = self.scale;
+
+				var centerScreenX = (p1.clientX + p2.clientX) / 2;
+				var centerScreenY = (p1.clientY + p2.clientY) / 2;
+				pinchSvgCenter = self.screenToSvg(centerScreenX, centerScreenY);
+			}
+		});
+
+		// Unified Pointer Move
+		window.addEventListener('pointermove', function(e) {
+			if (!self.activePointers[e.pointerId]) return;
+
+			self.activePointers[e.pointerId].clientX = e.clientX;
+			self.activePointers[e.pointerId].clientY = e.clientY;
+
+			var pIds = Object.keys(self.activePointers);
+			var count = pIds.length;
+
+			if (self.isPinching && count >= 2) {
+				var p1 = self.activePointers[pIds[0]];
+				var p2 = self.activePointers[pIds[1]];
+
+				var curDist = Math.hypot(p2.clientX - p1.clientX, p2.clientY - p1.clientY);
+				if (pinchStartDist > 5 && curDist > 5) {
+					var factor = curDist / pinchStartDist;
+					var targetScale = Math.min(Math.max(pinchStartScale * factor, 0.4), 2.2);
+
+					var curCenterX = (p1.clientX + p2.clientX) / 2;
+					var curCenterY = (p1.clientY + p2.clientY) / 2;
+					var rect = self.svg.getBoundingClientRect();
+
+					self.scale = targetScale;
+					self.panX = (curCenterX - rect.left) - (pinchSvgCenter.x * targetScale);
+					self.panY = (curCenterY - rect.top) - (pinchSvgCenter.y * targetScale);
+
+					self.scheduleRender();
+				}
+			} else if (self.dragNode && e.pointerId === self.dragPointerId) {
+				var dx = e.clientX - self.dragStartScreen.x;
+				var dy = e.clientY - self.dragStartScreen.y;
+				// 4px movement threshold separates taps from drags
+				if (!self.hasMoved && (dx * dx + dy * dy > 16)) {
+					self.hasMoved = true;
+				}
+
+				if (self.hasMoved) {
+					var pt = self.screenToSvg(e.clientX, e.clientY);
+					self.dragNode.x = Math.round(pt.x - self.dragOffset.x);
+					self.dragNode.y = Math.round(pt.y - self.dragOffset.y);
+					self.isDirty = true;
+					self.scheduleRender();
+				}
+			} else if (self.isPanning) {
+				self.panX = e.clientX - panStartX;
+				self.panY = e.clientY - panStartY;
+				self.scheduleRender();
+			}
+		});
+
+		// End pointer handling (pointerup / pointercancel)
+		var endPointerHandler = function(e) {
+			if (!self.activePointers[e.pointerId]) return;
+			delete self.activePointers[e.pointerId];
+
+			try {
+				if (self.svg.hasPointerCapture && self.svg.hasPointerCapture(e.pointerId)) {
+					self.svg.releasePointerCapture(e.pointerId);
+				}
+			} catch (err) {}
+
+			var pIds = Object.keys(self.activePointers);
+			var count = pIds.length;
+
+			if (e.pointerId === self.dragPointerId) {
+				if (self.dragNode) {
+					if (self.hasMoved) {
+						self.updateNodePosition(self.dragNode.id);
+						self.updateLinks();
+						if (self.options.onNodeMoved) {
+							self.options.onNodeMoved(self.dragNode);
+						}
+					}
+					self.dragNode = null;
+				}
+				self.dragPointerId = null;
+			}
+
+			if (count === 0) {
+				if (self.isPanning) {
+					self.isPanning = false;
+					self.svg.classList.remove('panning');
+					self.applyTransform();
+				}
+				self.isPinching = false;
+			} else if (count === 1) {
+				// Transition from pinch back to single pan
+				self.isPinching = false;
+				var remId = pIds[0];
+				var p = self.activePointers[remId];
+				self.isPanning = true;
+				panStartX = p.clientX - self.panX;
+				panStartY = p.clientY - self.panY;
+			}
+		};
+
+		window.addEventListener('pointerup', endPointerHandler);
+		window.addEventListener('pointercancel', endPointerHandler);
+	},
+
+	scheduleRender: function() {
+		var self = this;
+		if (this.rafPending) return;
+		this.rafPending = true;
+		window.requestAnimationFrame(function() {
+			self.rafPending = false;
+			if (self.dragNode) {
+				self.updateNodePosition(self.dragNode.id);
+				self.updateLinks();
+			} else {
+				self.applyTransform();
 			}
 		});
 	},
@@ -302,8 +450,9 @@ window.AcsTopologyCanvas.prototype = {
 			'<text class="acs-node-stat" x="110" y="82">↑ <tspan class="acs-node-stat-up" id="tx-' + node.id + '">' + (node.tx_formatted || '0 bps') + '</tspan></text>' +
 			'<text class="acs-node-stat" x="12" y="99">Users: <tspan class="acs-node-stat-users" id="users-' + node.id + '">' + (node.clients != null ? node.clients : '0') + '</tspan></text>' +
 			
-			// Actions trigger icon (gear / dots)
+			// Actions trigger icon (gear / dots) with comfortable mobile touch target
 			'<g class="acs-node-action-btn" id="act-' + node.id + '" transform="translate(' + (width - 26) + ', 86)" cursor="pointer">' +
+			'  <rect x="-8" y="-8" width="32" height="32" fill="transparent" pointer-events="all"/>' +
 			'  <circle cx="8" cy="8" r="10" fill="#334155" opacity="0.8"/>' +
 			'  <text x="8" y="12" font-size="12" font-weight="bold" fill="#ffffff" text-anchor="middle">⋮</text>' +
 			'</g>';
@@ -314,6 +463,9 @@ window.AcsTopologyCanvas.prototype = {
 		var self = this;
 		var actBtn = g.querySelector('#act-' + node.id);
 		if (actBtn) {
+			actBtn.addEventListener('pointerdown', function(e) {
+				e.stopPropagation();
+			});
 			actBtn.addEventListener('click', function(e) {
 				e.stopPropagation();
 				if (self.options.onNodeAction) self.options.onNodeAction(node, e);

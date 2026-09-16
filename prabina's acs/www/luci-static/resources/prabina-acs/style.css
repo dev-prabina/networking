@@ -171,6 +171,9 @@
 	overflow: hidden;
 	box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
 	user-select: none;
+	-webkit-user-select: none;
+	touch-action: none;
+	-webkit-touch-callout: none;
 }
 
 .acs-canvas-fullscreen {
@@ -187,6 +190,9 @@
 	width: 100%;
 	height: 100%;
 	cursor: grab;
+	touch-action: none;
+	-webkit-user-select: none;
+	user-select: none;
 }
 
 .acs-canvas-svg.panning {
@@ -207,11 +213,12 @@
 	border-radius: 8px;
 	border: 1px solid #334155;
 	z-index: 10;
+	touch-action: manipulation;
 }
 
 .acs-ctrl-btn {
-	width: 34px;
-	height: 34px;
+	width: 38px;
+	height: 38px;
 	display: flex;
 	align-items: center;
 	justify-content: center;
@@ -219,8 +226,9 @@
 	border: 1px solid #475569;
 	color: #e2e8f0;
 	border-radius: 6px;
-	font-size: 16px;
+	font-size: 17px;
 	cursor: pointer;
+	touch-action: manipulation;
 	transition: background 0.15s;
 }
 .acs-ctrl-btn:hover {
@@ -262,12 +270,20 @@
 
 /* SVG Node Card Styles (Rich Dark Contrast) */
 .acs-node-group {
-	cursor: pointer;
+	cursor: grab;
+	touch-action: none;
+	-webkit-user-select: none;
+	user-select: none;
 	transition: filter 0.15s ease;
 }
 
 .acs-node-group:hover {
 	filter: drop-shadow(0 6px 14px rgba(0, 0, 0, 0.5));
+}
+
+.acs-node-action-btn {
+	cursor: pointer;
+	touch-action: manipulation;
 }
 
 .acs-node-bg {
@@ -837,5 +853,31 @@
 	padding: 2px 6px;
 	border-radius: 10px;
 }
+
+/* Mobile & Touch Responsiveness */
+@media (max-width: 768px) {
+	.acs-canvas-wrapper {
+		height: 68vh;
+		min-height: 460px;
+	}
+	.acs-ctrl-btn {
+		width: 42px;
+		height: 42px;
+		font-size: 19px;
+	}
+	.acs-canvas-controls {
+		bottom: 12px;
+		right: 12px;
+		gap: 8px;
+		padding: 7px;
+	}
+	.acs-header {
+		padding: 12px 14px;
+	}
+	.acs-title {
+		font-size: 18px;
+	}
+}
+
 
 

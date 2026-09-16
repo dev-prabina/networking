@@ -855,9 +855,24 @@ return view.extend({
 		var ip = node.ip || '100.64.2.1';
 		var webUrl = 'http://' + ip;
 
+		var menuWidth = 185;
+		var menuHeight = isLocal ? 220 : 260;
+		var posX = (evt && evt.clientX != null) ? evt.clientX : (window.innerWidth / 2 - menuWidth / 2);
+		var posY = (evt && evt.clientY != null) ? evt.clientY : (window.innerHeight / 2 - menuHeight / 2);
+
+		// Clamp within mobile screen boundaries
+		if (posX + menuWidth > window.innerWidth - 12) {
+			posX = Math.max(10, window.innerWidth - menuWidth - 12);
+		}
+		if (posX < 10) posX = 10;
+		if (posY + menuHeight > window.innerHeight - 12) {
+			posY = Math.max(10, window.innerHeight - menuHeight - 12);
+		}
+		if (posY < 10) posY = 10;
+
 		var menu = E('div', {
 			'id': 'acs-node-context-menu',
-			'style': 'position: fixed; top: ' + evt.clientY + 'px; left: ' + evt.clientX + 'px; background: #ffffff; border: 1px solid #cbd5e1; border-radius: 8px; box-shadow: 0 10px 25px rgba(0,0,0,0.15); z-index: 10001; min-width: 175px; padding: 6px 0; overflow: hidden;'
+			'style': 'position: fixed; top: ' + posY + 'px; left: ' + posX + 'px; background: #ffffff; border: 1px solid #cbd5e1; border-radius: 8px; box-shadow: 0 10px 25px rgba(0,0,0,0.2); z-index: 10001; min-width: ' + menuWidth + 'px; padding: 6px 0; overflow: hidden;'
 		}, [
 			// Open Web UI
 			E('a', {
@@ -930,10 +945,12 @@ return view.extend({
 			if (!menu.contains(e.target)) {
 				menu.remove();
 				window.removeEventListener('click', closeHandler);
+				window.removeEventListener('pointerdown', closeHandler);
 			}
 		};
 		setTimeout(function() {
 			window.addEventListener('click', closeHandler);
+			window.addEventListener('pointerdown', closeHandler);
 		}, 10);
 
 		document.body.appendChild(menu);
