@@ -1,0 +1,36 @@
+#!/bin/sh
+# Prabina's ACS - SSH Connectivity Helper
+# Tests SSH connection to a remote router without exposing credentials
+
+ACTION="$1"
+IP="$2"
+USER="${3:-root}"
+PASS="$4"
+PORT="${5:-22}"
+
+if [ "$ACTION" = "test-id" ]; then
+	DEV_ID="$2"
+	. /lib/functions.sh
+	config_load prabina_acs
+	config_get IP "$DEV_ID" ip ""
+	config_get USER "$DEV_ID" username "root"
+	config_get PASS "$DEV_ID" password ""
+	config_get PORT "$DEV_ID" port "22"
+fi
+
+if [ -z "$IP" ]; then
+	echo '{"success":false,"error":"No IP address provided"}'
+	exit 1
+fi
+
+out=$(timeout 4 sshpass -p "$PASS" dbclient -y -y -I 3 -p "$PORT" "${USER}@${IP}" 'cat /proc/sys/kernel/hostname 2>/dev/null || uname -n' 2>&1)
+rc=$?
+
+if [ $rc -eq 0 ] && [ -n "$out" ] && ! echo "$out" | grep -q "Permission denied"; then
+	hostname=$(echo "$out" | tail -n 1 | tr -d '\r\n')
+	printf '{"success":true,"ip":"%s","hostname":"%s","message":"SSH connection successful"}\n' "$IP" "$hostname"
+else
+	err=$(echo "$out" | tr '\n' ' ' | sed 's/"/\\"/g' | head -c 120)
+	[ -z "$err" ] && err="Connection timed out or host unreachable"
+	printf '{"success":false,"ip":"%s","error":"%s"}\n' "$IP" "$err"
+fi

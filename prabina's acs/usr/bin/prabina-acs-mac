@@ -1,0 +1,185 @@
+#!/bin/sh
+# prabina's acs - MAC Whitelist Push Engine
+# Supports GL.iNet AX180P and Jio Pure OpenWrt with Add and Replace modes
+
+MODE="$1"        # "add" or "replace"
+MACS_INPUT="$2"  # Space/newline separated MAC addresses or path to file
+TARGET_DEV="$3"  # Optional specific device id, comma-separated ids, or empty/all for all registered routers
+
+if [ -z "$MODE" ] || [ -z "$MACS_INPUT" ]; then
+	echo '{"success":false,"error":"Usage: prabina-acs-mac <add|replace> <macs_or_file> [device_id]"}'
+	exit 1
+fi
+
+# Read MACs from file or argument
+raw_macs=""
+if [ -f "$MACS_INPUT" ]; then
+	raw_macs=$(cat "$MACS_INPUT" 2>/dev/null)
+else
+	raw_macs="$MACS_INPUT"
+fi
+
+# Normalize and validate MAC addresses
+clean_macs=""
+invalid_macs=""
+seen_macs=""
+
+for m in $(echo "$raw_macs" | tr ',' ' ' | tr '\n' ' ' | tr '\r' ' '); do
+	# Normalize to uppercase and colons
+	norm_m=$(echo "$m" | tr 'a-z' 'A-Z' | tr '-' ':')
+	# Check format
+	if echo "$norm_m" | grep -Eq '^([0-9A-F]{2}:){5}[0-9A-F]{2}$'; then
+		# Check duplicate
+		case " $seen_macs " in
+			*" $norm_m "*) ;;
+			*)
+				clean_macs="${clean_macs} ${norm_m}"
+				seen_macs="${seen_macs} ${norm_m}"
+				;;
+		esac
+	else
+		[ -n "$m" ] && invalid_macs="${invalid_macs} ${m}"
+	fi
+done
+
+clean_macs=$(echo "$clean_macs" | sed 's/^ //')
+invalid_macs=$(echo "$invalid_macs" | sed 's/^ //')
+
+if [ -z "$clean_macs" ]; then
+	printf '{"success":false,"error":"No valid MAC addresses provided","invalid_macs":"%s"}\n' "$invalid_macs"
+	exit 1
+fi
+
+mac_count=$(echo "$clean_macs" | wc -w)
+
+. /lib/functions.sh
+config_load prabina_acs
+
+results_json=""
+total=0
+success_count=0
+failed_count=0
+
+push_to_device() {
+	local cfg="$1"
+	local name ip user pass type port
+	config_get name "$cfg" name "$cfg"
+	config_get ip "$cfg" ip ""
+	config_get user "$cfg" username "root"
+	config_get pass "$cfg" password ""
+	config_get type "$cfg" type "jio"
+	config_get port "$cfg" port "22"
+
+	# Check target filter (supports comma-separated list or exact match or 'all'/empty)
+	if [ -n "$TARGET_DEV" ] && [ "$TARGET_DEV" != "all" ]; then
+		case ",${TARGET_DEV}," in
+			*",${cfg},"*) ;;
+			*) return ;;
+		esac
+	fi
+
+	# Handle local Header Gateway device directly without SSH
+	if [ "$cfg" = "local" ]; then
+		local iface_count
+		iface_count=$(uci show wireless 2>/dev/null | grep -c '=wifi-iface')
+		[ "$iface_count" -eq 0 ] && return
+
+		total=$((total + 1))
+		local local_success=0
+		if [ "$MODE" = "add" ]; then
+			for MAC in $clean_macs; do
+				for SEC in $(uci show wireless 2>/dev/null | sed -n 's/^\(wireless\.[^.]*\)=wifi-iface$/\1/p'); do
+					uci add_list "$SEC.maclist=$MAC"
+				done
+			done
+			if uci commit wireless && wifi reload >/dev/null 2>&1; then
+				local_success=1
+			fi
+		else
+			for SEC in $(uci show wireless 2>/dev/null | sed -n 's/^\(wireless\.[^.]*\)=wifi-iface$/\1/p'); do
+				uci -q delete "$SEC.maclist"
+				uci -q set "$SEC.macfilter=allow"
+				for MAC in $clean_macs; do
+					uci add_list "$SEC.maclist=$MAC"
+				done
+			done
+			if uci commit wireless && wifi reload >/dev/null 2>&1; then
+				local_success=1
+			fi
+		fi
+
+		if [ $local_success -eq 1 ]; then
+			success_count=$((success_count + 1))
+			local msg="${mac_count} MAC(s) successfully applied (${MODE} mode)"
+			local item
+			item=$(printf '{"id":"local","name":"%s","type":"header_gateway","ip":"%s","status":"success","message":"%s"}' "$name" "$ip" "$msg")
+			[ -n "$results_json" ] && results_json="${results_json},"
+			results_json="${results_json}${item}"
+		else
+			failed_count=$((failed_count + 1))
+			local item
+			item=$(printf '{"id":"local","name":"%s","type":"header_gateway","ip":"%s","status":"failed","message":"Failed to apply local wireless MAC filter"}' "$name" "$ip")
+			[ -n "$results_json" ] && results_json="${results_json},"
+			results_json="${results_json}${item}"
+		fi
+		return
+	fi
+
+	total=$((total + 1))
+
+	if [ -z "$ip" ]; then
+		failed_count=$((failed_count + 1))
+		local item
+		item=$(printf '{"id":"%s","name":"%s","type":"%s","ip":"","status":"failed","message":"Missing Tailscale IP"}' "$cfg" "$name" "$type")
+		[ -n "$results_json" ] && results_json="${results_json},"
+		results_json="${results_json}${item}"
+		return
+	fi
+
+	# Generate category-specific commands safely
+	local remote_cmd=""
+	if [ "$type" = "glinet" ]; then
+		if [ "$MODE" = "add" ]; then
+			remote_cmd="for MAC in $clean_macs; do uci add_list gl-black_white_list.white.mac=\"\$MAC\"; done; uci commit gl-black_white_list && /etc/init.d/gl-black_white_list restart >/dev/null 2>&1 && echo SUCCESS"
+		else
+			# Replace mode: safe replacement
+			remote_cmd="uci -q delete gl-black_white_list.white.mac; uci -q set gl-black_white_list.global.enable='1'; uci -q set gl-black_white_list.global.mode='white'; for MAC in $clean_macs; do uci add_list gl-black_white_list.white.mac=\"\$MAC\"; done; uci commit gl-black_white_list && /etc/init.d/gl-black_white_list restart >/dev/null 2>&1 && echo SUCCESS"
+		fi
+	else
+		# Jio Pure OpenWrt
+		if [ "$MODE" = "add" ]; then
+			remote_cmd="for MAC in $clean_macs; do for SEC in \$(uci show wireless 2>/dev/null | sed -n 's/^\(wireless\.[^.]*\)=wifi-iface\$/\1/p'); do uci add_list \"\$SEC.maclist=\$MAC\"; done; done; uci commit wireless && wifi reload >/dev/null 2>&1 && echo SUCCESS"
+		else
+			# Replace mode: safe replacement
+			remote_cmd="for SEC in \$(uci show wireless 2>/dev/null | sed -n 's/^\(wireless\.[^.]*\)=wifi-iface\$/\1/p'); do uci -q delete \"\$SEC.maclist\"; uci -q set \"\$SEC.macfilter=allow\"; for MAC in $clean_macs; do uci add_list \"\$SEC.maclist=\$MAC\"; done; done; uci commit wireless && wifi reload >/dev/null 2>&1 && echo SUCCESS"
+		fi
+	fi
+
+	# Execute via timeout sshpass dbclient
+	local exec_out
+	exec_out=$(timeout 8 sshpass -p "$pass" dbclient -y -y -I 6 -p "$port" "${user}@${ip}" "$remote_cmd" 2>&1)
+	local rc=$?
+
+	if [ $rc -eq 0 ] && echo "$exec_out" | grep -q "SUCCESS"; then
+		success_count=$((success_count + 1))
+		local msg="${mac_count} MAC(s) successfully applied (${MODE} mode)"
+		local item
+		item=$(printf '{"id":"%s","name":"%s","type":"%s","ip":"%s","status":"success","message":"%s"}' "$cfg" "$name" "$type" "$ip" "$msg")
+		[ -n "$results_json" ] && results_json="${results_json},"
+		results_json="${results_json}${item}"
+	else
+		failed_count=$((failed_count + 1))
+		local err_msg
+		err_msg=$(echo "$exec_out" | tr '\n' ' ' | sed 's/"/\\"/g' | head -c 120)
+		[ -z "$err_msg" ] && err_msg="SSH connection timed out or failed"
+		local item
+		item=$(printf '{"id":"%s","name":"%s","type":"%s","ip":"%s","status":"failed","message":"%s"}' "$cfg" "$name" "$type" "$ip" "$err_msg")
+		[ -n "$results_json" ] && results_json="${results_json},"
+		results_json="${results_json}${item}"
+	fi
+}
+
+config_foreach push_to_device device
+
+printf '{"success":true,"mode":"%s","mac_count":%d,"clean_macs":"%s","invalid_macs":"%s","total":%d,"success_count":%d,"failed_count":%d,"results":[%s]}\n' \
+	"$MODE" "$mac_count" "$clean_macs" "$invalid_macs" "$total" "$success_count" "$failed_count" "$results_json"

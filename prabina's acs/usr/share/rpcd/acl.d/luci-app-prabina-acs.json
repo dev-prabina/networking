@@ -1,0 +1,17 @@
+{
+	"luci-app-prabina-acs": {
+		"description": "Grant access to prabina's acs Management",
+		"read": {
+			"ubus": {
+				"luci.prabina_acs": [ "*" ]
+			},
+			"uci": [ "prabina_acs" ]
+		},
+		"write": {
+			"ubus": {
+				"luci.prabina_acs": [ "*" ]
+			},
+			"uci": [ "prabina_acs" ]
+		}
+	}
+}

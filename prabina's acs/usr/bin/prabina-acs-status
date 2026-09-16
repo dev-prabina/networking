@@ -1,0 +1,412 @@
+#!/bin/sh
+# Prabina's ACS - Device Status Collector
+# Reads real metrics from Header Gateway (local) and Remote Routers over Tailscale SSH
+
+CACHE_FILE="/var/run/prabina_acs_cache.json"
+RATE_FILE="/var/run/prabina_acs_rates.json"
+CACHE_TTL=8
+
+format_speed() {
+	local bytes="$1"
+	[ -z "$bytes" ] && bytes=0
+	# Convert bytes/s to bits/s
+	local bits=$((bytes * 8))
+	if [ "$bits" -ge 1000000 ]; then
+		local mbps=$((bits / 100000))
+		local int_part=$((mbps / 10))
+		local dec_part=$((mbps % 10))
+		echo "${int_part}.${dec_part} Mbps"
+	elif [ "$bits" -ge 1000 ]; then
+		local kbps=$((bits / 1000))
+		echo "${kbps} Kbps"
+	else
+		echo "${bits} bps"
+	fi
+}
+
+get_local_metrics() {
+	local hostname
+	hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null || uname -n)
+	local uptime
+	uptime=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)
+	local ts_ip
+	ts_ip=$(tailscale ip -4 2>/dev/null || echo "100.64.2.1")
+	[ -z "$ts_ip" ] && ts_ip="100.64.2.1"
+	local now
+	now=$(date +%s)
+
+	# 1. Detect active WAN interface dynamically
+	local wan_dev=""
+	wan_dev=$(ubus call network.interface.wan status 2>/dev/null | grep -m1 -E '"(l3_device|device)"' | cut -d'"' -f4)
+	[ -z "$wan_dev" ] && wan_dev=$(ubus call network.interface.wan6 status 2>/dev/null | grep -m1 -E '"(l3_device|device)"' | cut -d'"' -f4)
+	[ -z "$wan_dev" ] && wan_dev=$(awk '$2=="00000000" && $1!="lo" && $1!~"^tailscale" {print $1; exit}' /proc/net/route 2>/dev/null)
+	if [ -z "$wan_dev" ]; then
+		if grep -qE '^[[:space:]]*wan:' /proc/net/dev 2>/dev/null; then
+			wan_dev="wan"
+		elif grep -qE '^[[:space:]]*eth0:' /proc/net/dev 2>/dev/null; then
+			wan_dev="eth0"
+		fi
+	fi
+
+	# 2. Extract RX and TX bytes for $wan_dev from /proc/net/dev
+	local wan_rx=0 wan_tx=0
+	if [ -n "$wan_dev" ]; then
+		local line
+		line=$(grep -E "^[[:space:]]*${wan_dev}:" /proc/net/dev 2>/dev/null)
+		if [ -n "$line" ]; then
+			local line_clean
+			line_clean=$(echo "$line" | sed 's/^[^:]*://')
+			wan_rx=$(echo "$line_clean" | awk '{print $1}')
+			wan_tx=$(echo "$line_clean" | awk '{print $9}')
+		fi
+	fi
+	[ -z "$wan_rx" ] && wan_rx=0
+	[ -z "$wan_tx" ] && wan_tx=0
+
+	# 3. Router's own MACs to exclude
+	local r_macs=""
+	for a in /sys/class/net/*/address; do
+		[ -f "$a" ] || continue
+		local m
+		m=$(cat "$a" 2>/dev/null | tr 'A-Z' 'a-z' | tr -d '\r\n ')
+		[ -n "$m" ] && [ "$m" != "00:00:00:00:00:00" ] && r_macs="${r_macs} ${m}"
+	done
+
+	# 4. WAN gateway MAC to exclude
+	local wan_gw=""
+	if [ -n "$wan_dev" ]; then
+		wan_gw=$(awk -v dev="$wan_dev" '$6==dev && $3=="0x2"{print tolower($4); exit}' /proc/net/arp 2>/dev/null)
+	fi
+
+	# 5. Associated Wi-Fi stations
+	local wifi_macs=""
+	local wifi_src="none"
+	local hapd_objs
+	hapd_objs=$(ubus list 2>/dev/null | grep -E '^hostapd\.')
+	if [ -n "$hapd_objs" ]; then
+		for hd in $hapd_objs; do
+			for m in $(ubus call "$hd" get_clients 2>/dev/null | grep -B 1 '"assoc": true' | grep -E '^[[:space:]]*"[0-9a-fA-F:]{17}"' | cut -d'"' -f2); do
+				local norm
+				norm=$(echo "$m" | tr 'A-Z' 'a-z')
+				case " $wifi_macs " in
+					*" $norm "*) ;;
+					*) wifi_macs="${wifi_macs} ${norm}" ;;
+				esac
+			done
+		done
+		[ -n "$wifi_macs" ] && wifi_src="hostapd"
+	fi
+
+	if [ -z "$wifi_macs" ] && which iw >/dev/null 2>&1; then
+		for iface in $(iw dev 2>/dev/null | grep Interface | awk '{print $2}'); do
+			for m in $(iw dev "$iface" station dump 2>/dev/null | grep -i Station | awk '{print $2}'); do
+				local norm
+				norm=$(echo "$m" | tr 'A-Z' 'a-z')
+				case " $wifi_macs " in
+					*" $norm "*) ;;
+					*) wifi_macs="${wifi_macs} ${norm}" ;;
+				esac
+			done
+		done
+		[ -n "$wifi_macs" ] && wifi_src="iw"
+	fi
+
+	# 6. Active wired clients (flag 0x2 on LAN bridges, excluding WAN, tailscale, router MACs, WAN GW MAC, Wi-Fi MACs)
+	local wired_macs=""
+	for entry in $(awk '$3=="0x2"{print $6 ":" tolower($4)}' /proc/net/arp 2>/dev/null); do
+		local iface=$(echo "$entry" | cut -d: -f1)
+		local mac=$(echo "$entry" | cut -d: -f2-)
+		[ -n "$wan_dev" ] && [ "$iface" = "$wan_dev" ] && continue
+		case "$iface" in
+			lo*|tailscale*|tun*|wg*|wan*) continue ;;
+		esac
+		[ "$mac" = "00:00:00:00:00:00" ] && continue
+		case " $r_macs " in
+			*" $mac "*) continue ;;
+		esac
+		[ -n "$wan_gw" ] && [ "$mac" = "$wan_gw" ] && continue
+		case " $wifi_macs " in
+			*" $mac "*) continue ;;
+		esac
+		case " $wired_macs " in
+			*" $mac "*) continue ;;
+			*) wired_macs="${wired_macs} ${mac}" ;;
+		esac
+	done
+
+	local w_cnt=0
+	for _ in $wifi_macs; do w_cnt=$((w_cnt + 1)); done
+	local wired_cnt=0
+	for _ in $wired_macs; do wired_cnt=$((wired_cnt + 1)); done
+	local clients=$((w_cnt + wired_cnt))
+	local client_src="${wifi_src}(${w_cnt})+wired(${wired_cnt})"
+
+	# 7. Speed delta from RATE_FILE
+	local prev_time prev_rx prev_tx rx_rate=0 tx_rate=0
+	if [ -f "$RATE_FILE" ]; then
+		prev_time=$(grep "^local:time=" "$RATE_FILE" 2>/dev/null | cut -d= -f2)
+		prev_rx=$(grep "^local:rx=" "$RATE_FILE" 2>/dev/null | cut -d= -f2)
+		prev_tx=$(grep "^local:tx=" "$RATE_FILE" 2>/dev/null | cut -d= -f2)
+		
+		if [ -n "$prev_time" ] && [ -n "$prev_rx" ] && [ -n "$prev_tx" ]; then
+			local dt=$((now - prev_time))
+			if [ "$dt" -gt 0 ] && [ "$dt" -le 300 ]; then
+				if [ "$wan_rx" -ge "$prev_rx" ]; then
+					rx_rate=$(((wan_rx - prev_rx) / dt))
+				else
+					rx_rate=0
+				fi
+				if [ "$wan_tx" -ge "$prev_tx" ]; then
+					tx_rate=$(((wan_tx - prev_tx) / dt))
+				else
+					tx_rate=0
+				fi
+			fi
+		fi
+	fi
+
+	# Update rate file for local
+	grep -v "^local:" "$RATE_FILE" 2>/dev/null > "${RATE_FILE}.tmp" 2>/dev/null || true
+	echo "local:time=$now" >> "${RATE_FILE}.tmp"
+	echo "local:rx=$wan_rx" >> "${RATE_FILE}.tmp"
+	echo "local:tx=$wan_tx" >> "${RATE_FILE}.tmp"
+	mv "${RATE_FILE}.tmp" "$RATE_FILE" 2>/dev/null
+
+	local rx_fmt tx_fmt
+	rx_fmt=$(format_speed "$rx_rate")
+	tx_fmt=$(format_speed "$tx_rate")
+
+	printf '{"id":"local","online":true,"hostname":"%s","ip":"%s","clients":%d,"rx_rate":%d,"tx_rate":%d,"rx_formatted":"%s","tx_formatted":"%s","uptime":%d,"wan_dev":"%s","wan_rx":%s,"wan_tx":%s,"client_src":"%s","updated":%d}' \
+		"$hostname" "$ts_ip" "$clients" "$rx_rate" "$tx_rate" "$rx_fmt" "$tx_fmt" "$uptime" "$wan_dev" "$wan_rx" "$wan_tx" "$client_src" "$now"
+}
+
+get_remote_metrics() {
+	local dev_id="$1"
+	local dev_ip="$2"
+	local dev_user="${3:-root}"
+	local dev_pass="$4"
+	local dev_port="${5:-22}"
+
+	if [ -z "$dev_ip" ]; then
+		printf '{"id":"%s","online":false,"rx_formatted":"--","tx_formatted":"--","clients":"--","rx_rate":0,"tx_rate":0,"wan_dev":"--","wan_rx":0,"wan_tx":0,"client_src":"--","updated":0,"error":"No IP configured"}' "$dev_id"
+		return
+	fi
+
+	local probe_res
+	probe_res=$(timeout 4 sshpass -p "$dev_pass" dbclient -y -y -I 3 -p "$dev_port" "${dev_user}@${dev_ip}" '
+h=$(cat /proc/sys/kernel/hostname 2>/dev/null || uname -n)
+u=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)
+
+w_dev=$(ubus call network.interface.wan status 2>/dev/null | grep -m1 -E "\"(l3_device|device)\"" | cut -d\" -f4)
+[ -z "$w_dev" ] && w_dev=$(ubus call network.interface.wan6 status 2>/dev/null | grep -m1 -E "\"(l3_device|device)\"" | cut -d\" -f4)
+[ -z "$w_dev" ] && w_dev=$(awk "\$2==\"00000000\" && \$1!=\"lo\" && \$1!~\"^tailscale\" {print \$1; exit}" /proc/net/route 2>/dev/null)
+if [ -z "$w_dev" ]; then
+    if grep -qE "^[[:space:]]*wan:" /proc/net/dev 2>/dev/null; then
+        w_dev="wan"
+    elif grep -qE "^[[:space:]]*eth0:" /proc/net/dev 2>/dev/null; then
+        w_dev="eth0"
+    fi
+fi
+
+w_rx=0
+w_tx=0
+if [ -n "$w_dev" ]; then
+    l=$(grep -E "^[[:space:]]*${w_dev}:" /proc/net/dev 2>/dev/null)
+    if [ -n "$l" ]; then
+        lc=$(echo "$l" | sed "s/^[^:]*://")
+        w_rx=$(echo "$lc" | awk "{print \$1}")
+        w_tx=$(echo "$lc" | awk "{print \$9}")
+    fi
+fi
+
+r_macs=""
+for a in /sys/class/net/*/address; do
+    [ -f "$a" ] || continue
+    m=$(cat "$a" 2>/dev/null | tr "A-Z" "a-z" | tr -d "\r\n ")
+    [ -n "$m" ] && [ "$m" != "00:00:00:00:00:00" ] && r_macs="${r_macs} ${m}"
+done
+
+w_gw=""
+if [ -n "$w_dev" ]; then
+    w_gw=$(awk -v dev="$w_dev" "\$6==dev && \$3==\"0x2\"{print tolower(\$4); exit}" /proc/net/arp 2>/dev/null)
+fi
+
+wifi_macs=""
+wifi_src="none"
+hapd_objs=$(ubus list 2>/dev/null | grep -E "^hostapd\.")
+if [ -n "$hapd_objs" ]; then
+    for hd in $hapd_objs; do
+        for m in $(ubus call "$hd" get_clients 2>/dev/null | grep -B 1 "\"assoc\": true" | grep -E "^[[:space:]]*\"[0-9a-fA-F:]{17}\"" | cut -d\" -f2); do
+            norm=$(echo "$m" | tr "A-Z" "a-z")
+            case " $wifi_macs " in
+                *" $norm "*) ;;
+                *) wifi_macs="${wifi_macs} ${norm}" ;;
+            esac
+        done
+    done
+    [ -n "$wifi_macs" ] && wifi_src="hostapd"
+fi
+
+if [ -z "$wifi_macs" ] && which iw >/dev/null 2>&1; then
+    for iface in $(iw dev 2>/dev/null | grep Interface | awk "{print \$2}"); do
+        for m in $(iw dev "$iface" station dump 2>/dev/null | grep -i Station | awk "{print \$2}"); do
+            norm=$(echo "$m" | tr "A-Z" "a-z")
+            case " $wifi_macs " in
+                *" $norm "*) ;;
+                *) wifi_macs="${wifi_macs} ${norm}" ;;
+            esac
+        done
+    done
+    [ -n "$wifi_macs" ] && wifi_src="iw"
+fi
+
+wired_macs=""
+for entry in $(awk "\$3==\"0x2\"{print \$6 \":\" tolower(\$4)}" /proc/net/arp 2>/dev/null); do
+    iface=$(echo "$entry" | cut -d: -f1)
+    mac=$(echo "$entry" | cut -d: -f2-)
+    [ -n "$w_dev" ] && [ "$iface" = "$w_dev" ] && continue
+    case "$iface" in
+        lo*|tailscale*|tun*|wg*|wan*) continue ;;
+    esac
+    [ "$mac" = "00:00:00:00:00:00" ] && continue
+    case " $r_macs " in
+        *" $mac "*) continue ;;
+    esac
+    [ -n "$w_gw" ] && [ "$mac" = "$w_gw" ] && continue
+    case " $wifi_macs " in
+        *" $mac "*) continue ;;
+    esac
+    case " $wired_macs " in
+        *" $mac "*) continue ;;
+        *) wired_macs="${wired_macs} ${mac}" ;;
+    esac
+done
+
+w_cnt=0
+for _ in $wifi_macs; do w_cnt=$((w_cnt + 1)); done
+wired_cnt=0
+for _ in $wired_macs; do wired_cnt=$((wired_cnt + 1)); done
+total=$((w_cnt + wired_cnt))
+
+echo "HOST=$h"
+echo "UPTIME=$u"
+echo "WAN_DEV=$w_dev"
+echo "WAN_RX=$w_rx"
+echo "WAN_TX=$w_tx"
+echo "CLIENTS=$total"
+echo "CLIENTS_SRC=${wifi_src}(${w_cnt})+wired(${wired_cnt})"
+' 2>/dev/null)
+
+	if [ $? -ne 0 ] || [ -z "$probe_res" ]; then
+		printf '{"id":"%s","online":false,"rx_formatted":"--","tx_formatted":"--","clients":"--","rx_rate":0,"tx_rate":0,"wan_dev":"--","wan_rx":0,"wan_tx":0,"client_src":"--","updated":0,"error":"Unreachable or auth failed"}' "$dev_id"
+		return
+	fi
+
+	local hostname uptime clients wan_dev wan_rx wan_tx client_src
+	hostname=$(echo "$probe_res" | grep "^HOST=" | head -n1 | cut -d= -f2)
+	uptime=$(echo "$probe_res" | grep "^UPTIME=" | head -n1 | cut -d= -f2)
+	wan_dev=$(echo "$probe_res" | grep "^WAN_DEV=" | head -n1 | cut -d= -f2)
+	wan_rx=$(echo "$probe_res" | grep "^WAN_RX=" | head -n1 | cut -d= -f2)
+	wan_tx=$(echo "$probe_res" | grep "^WAN_TX=" | head -n1 | cut -d= -f2)
+	clients=$(echo "$probe_res" | grep "^CLIENTS=" | head -n1 | cut -d= -f2)
+	client_src=$(echo "$probe_res" | grep "^CLIENTS_SRC=" | head -n1 | cut -d= -f2)
+
+	[ -z "$hostname" ] && hostname="$dev_ip"
+	[ -z "$uptime" ] && uptime=0
+	[ -z "$wan_dev" ] && wan_dev="unknown"
+	[ -z "$wan_rx" ] && wan_rx=0
+	[ -z "$wan_tx" ] && wan_tx=0
+	[ -z "$clients" ] && clients=0
+	[ -z "$client_src" ] && client_src="unknown"
+
+	local now
+	now=$(date +%s)
+
+	local prev_time prev_rx prev_tx rx_rate=0 tx_rate=0
+	if [ -f "$RATE_FILE" ]; then
+		prev_time=$(grep "^${dev_id}:time=" "$RATE_FILE" 2>/dev/null | cut -d= -f2)
+		prev_rx=$(grep "^${dev_id}:rx=" "$RATE_FILE" 2>/dev/null | cut -d= -f2)
+		prev_tx=$(grep "^${dev_id}:tx=" "$RATE_FILE" 2>/dev/null | cut -d= -f2)
+		
+		if [ -n "$prev_time" ] && [ -n "$prev_rx" ] && [ -n "$prev_tx" ]; then
+			local dt=$((now - prev_time))
+			if [ "$dt" -gt 0 ] && [ "$dt" -le 300 ]; then
+				if [ "$wan_rx" -ge "$prev_rx" ]; then
+					rx_rate=$(((wan_rx - prev_rx) / dt))
+				else
+					rx_rate=0
+				fi
+				if [ "$wan_tx" -ge "$prev_tx" ]; then
+					tx_rate=$(((wan_tx - prev_tx) / dt))
+				else
+					tx_rate=0
+				fi
+			fi
+		fi
+	fi
+
+	grep -v "^${dev_id}:" "$RATE_FILE" 2>/dev/null > "${RATE_FILE}.tmp" 2>/dev/null || true
+	echo "${dev_id}:time=$now" >> "${RATE_FILE}.tmp"
+	echo "${dev_id}:rx=$wan_rx" >> "${RATE_FILE}.tmp"
+	echo "${dev_id}:tx=$wan_tx" >> "${RATE_FILE}.tmp"
+	mv "${RATE_FILE}.tmp" "$RATE_FILE" 2>/dev/null
+
+	local rx_fmt tx_fmt
+	rx_fmt=$(format_speed "$rx_rate")
+	tx_fmt=$(format_speed "$tx_rate")
+
+	printf '{"id":"%s","online":true,"hostname":"%s","ip":"%s","clients":%d,"rx_rate":%d,"tx_rate":%d,"rx_formatted":"%s","tx_formatted":"%s","uptime":%d,"wan_dev":"%s","wan_rx":%s,"wan_tx":%s,"client_src":"%s","updated":%d}' \
+		"$dev_id" "$hostname" "$dev_ip" "$clients" "$rx_rate" "$tx_rate" "$rx_fmt" "$tx_fmt" "$uptime" "$wan_dev" "$wan_rx" "$wan_tx" "$client_src" "$now"
+}
+
+target="$1"
+force="$2"
+
+now=$(date +%s)
+if [ -f "$CACHE_FILE" ] && [ "$force" != "force" ]; then
+	cache_time=$(grep "^#time=" "$CACHE_FILE" 2>/dev/null | cut -d= -f2)
+	if [ -n "$cache_time" ] && [ $((now - cache_time)) -lt $CACHE_TTL ]; then
+		# Return valid cache
+		grep -v "^#" "$CACHE_FILE"
+		exit 0
+	fi
+fi
+
+# Load UCI devices
+. /lib/functions.sh
+config_load prabina_acs
+
+output_devs=""
+
+# Always query Header Gateway
+loc_json=$(get_local_metrics)
+output_devs="\"local\": $loc_json"
+
+cb_device() {
+	local cfg="$1"
+	[ "$cfg" = "local" ] && return
+	local name ip user pass port
+	config_get name "$cfg" name "$cfg"
+	config_get ip "$cfg" ip ""
+	config_get user "$cfg" username "root"
+	config_get pass "$cfg" password ""
+	config_get port "$cfg" port "22"
+
+	if [ -n "$target" ] && [ "$target" != "all" ] && [ "$target" != "$cfg" ]; then
+		return
+	fi
+
+	local dev_json
+	dev_json=$(get_remote_metrics "$cfg" "$ip" "$user" "$pass" "$port")
+	output_devs="${output_devs}, \"${cfg}\": ${dev_json}"
+}
+
+config_foreach cb_device device
+
+final_json="{\"timestamp\": $now, \"devices\": { ${output_devs} }}"
+
+# Save to cache
+echo "#time=$now" > "$CACHE_FILE"
+echo "$final_json" >> "$CACHE_FILE"
+
+echo "$final_json"

@@ -1,0 +1,405 @@
+#!/usr/bin/ucode
+import * as fs from 'fs';
+import * as uci from 'uci';
+
+let cursor = uci.cursor();
+let action = ARGV[0];
+let method = ARGV[1];
+
+function read_stdin_json() {
+	let raw = fs.readfile('/dev/stdin');
+	if (raw) {
+		try {
+			return json(raw) || {};
+		} catch (e) {}
+	}
+	return {};
+}
+
+function get_tailscale_ip() {
+	let p = fs.popen('tailscale ip -4 2>/dev/null');
+	if (p) {
+		let line = trim(p.read('all') || '');
+		p.close();
+		if (match(line, /^[0-9\.]+$/)) return line;
+	}
+	return '100.64.2.1';
+}
+
+function get_hostname() {
+	let name = trim(fs.readfile('/proc/sys/kernel/hostname') || '');
+	return (length(name) > 0) ? name : 'Header Gateway';
+}
+
+function list_devices() {
+	cursor.load('prabina_acs');
+	let devs = [];
+	let ts_ip = get_tailscale_ip();
+	let hname = get_hostname();
+
+	cursor.foreach('prabina_acs', 'device', function(s) {
+		let is_local = (s['.name'] == 'local');
+		let dev_ip = is_local ? ts_ip : (s.ip || '');
+		let dev_name = is_local ? (s.name || hname) : (s.name || s['.name']);
+		let dev_type = is_local ? 'header_gateway' : (s.type || 'jio');
+		let dev_role = is_local ? 'header' : (s.role || 'child');
+		let dev_parent = (is_local || dev_role == 'header') ? '' : (s.parent || 'local');
+
+		push(devs, {
+			id: s['.name'],
+			name: dev_name,
+			ip: dev_ip,
+			username: is_local ? '' : (s.username || 'root'),
+			has_password: (!is_local && length(s.password || '') > 0),
+			type: dev_type,
+			role: dev_role,
+			parent: dev_parent,
+			port: int(s.port || 22),
+			x: int(s.x || (is_local ? 450 : 250)),
+			y: int(s.y || (is_local ? 70 : 250))
+		});
+	});
+
+	// If local wasn't found in uci, ensure it is returned
+	let found_local = false;
+	for (let d in devs) {
+		if (d.id == 'local') { found_local = true; break; }
+	}
+	if (!found_local) {
+		unshift(devs, {
+			id: 'local',
+			name: hname,
+			ip: ts_ip,
+			username: '',
+			has_password: false,
+			type: 'header_gateway',
+			role: 'header',
+			parent: '',
+			port: 22,
+			x: 450,
+			y: 70
+		});
+	}
+
+	return { success: true, devices: devs, gateway_ip: ts_ip, hostname: hname };
+}
+
+function add_device(args) {
+	let name = trim(args.name || '');
+	let ip = trim(args.ip || '');
+	let username = trim(args.username || 'root');
+	let password = args.password || '';
+	let type = trim(args.type || 'jio');
+	let role = trim(args.role || 'child');
+	let parent = trim(args.parent || 'local');
+	let port = int(args.port || 22);
+
+	if (length(name) == 0) return { success: false, error: 'Device name is required' };
+	if (!match(ip, /^([0-9]{1,3}\.){3}[0-9]{1,3}$/)) return { success: false, error: 'Invalid IPv4 address' };
+	if (type != 'glinet' && type != 'jio') type = 'jio';
+	if (role != 'header' && role != 'child') role = 'child';
+	if (role == 'header') parent = '';
+
+	cursor.load('prabina_acs');
+	let uuid_str = trim(fs.readfile('/proc/sys/kernel/random/uuid') || (time() + ''));
+	let id = 'dev_' + substr(uuid_str, 0, 8);
+
+	// Count existing devices to place newly added node nicely
+	let count = 0;
+	let header_count = 0;
+	cursor.foreach('prabina_acs', 'device', function(s) {
+		count++;
+		if (s.role == 'header' || s['.name'] == 'local') header_count++;
+	});
+
+	let new_x = (role == 'header') ? (450 + (header_count * 260)) : (180 + ((count % 4) * 230));
+	let new_y = (role == 'header') ? 70 : (260 + (int(count / 4) * 160));
+
+	cursor.set('prabina_acs', id, 'device');
+	cursor.set('prabina_acs', id, 'name', name);
+	cursor.set('prabina_acs', id, 'ip', ip);
+	cursor.set('prabina_acs', id, 'username', username);
+	cursor.set('prabina_acs', id, 'password', password);
+	cursor.set('prabina_acs', id, 'type', type);
+	cursor.set('prabina_acs', id, 'role', role);
+	cursor.set('prabina_acs', id, 'parent', parent);
+	cursor.set('prabina_acs', id, 'port', sprintf('%d', port));
+	cursor.set('prabina_acs', id, 'x', sprintf('%d', new_x));
+	cursor.set('prabina_acs', id, 'y', sprintf('%d', new_y));
+	cursor.commit('prabina_acs');
+
+	fs.chmod('/etc/config/prabina_acs', 0600);
+	return { success: true, id: id };
+}
+
+function edit_device(args) {
+	let id = trim(args.id || '');
+	if (length(id) == 0) return { success: false, error: 'Device ID is required' };
+
+	cursor.load('prabina_acs');
+	let sec = cursor.get_all('prabina_acs', id);
+	if (!sec) return { success: false, error: 'Device not found' };
+
+	if (id == 'local') {
+		if (args.name) cursor.set('prabina_acs', 'local', 'name', trim(args.name));
+		if (args.x) cursor.set('prabina_acs', 'local', 'x', sprintf('%d', int(args.x)));
+		if (args.y) cursor.set('prabina_acs', 'local', 'y', sprintf('%d', int(args.y)));
+		cursor.commit('prabina_acs');
+		try { fs.unlink('/var/run/prabina_acs_cache.json'); } catch(e) {}
+		return { success: true };
+	}
+
+	if (args.name && length(trim(args.name)) > 0) {
+		cursor.set('prabina_acs', id, 'name', trim(args.name));
+	}
+	if (args.ip && match(trim(args.ip), /^([0-9]{1,3}\.){3}[0-9]{1,3}$/)) {
+		cursor.set('prabina_acs', id, 'ip', trim(args.ip));
+	}
+	if (args.username && length(trim(args.username)) > 0) {
+		cursor.set('prabina_acs', id, 'username', trim(args.username));
+	}
+	// Only update password if non-empty string provided
+	if (args.password && length(args.password) > 0) {
+		cursor.set('prabina_acs', id, 'password', args.password);
+	}
+	if (args.type == 'glinet' || args.type == 'jio') {
+		cursor.set('prabina_acs', id, 'type', args.type);
+	}
+	if (args.role == 'header') {
+		cursor.set('prabina_acs', id, 'role', 'header');
+		cursor.set('prabina_acs', id, 'parent', '');
+	} else if (args.role == 'child') {
+		cursor.set('prabina_acs', id, 'role', 'child');
+		let p = trim(args.parent || '');
+		if (length(p) == 0 || p == id) {
+			p = sec.parent || 'local';
+			if (p == id) p = 'local';
+		}
+		cursor.set('prabina_acs', id, 'parent', p);
+	} else if (args.parent && args.parent != id) {
+		cursor.set('prabina_acs', id, 'parent', trim(args.parent));
+	}
+	if (args.port) {
+		cursor.set('prabina_acs', id, 'port', sprintf('%d', int(args.port)));
+	}
+	if (args.x) cursor.set('prabina_acs', id, 'x', sprintf('%d', int(args.x)));
+	if (args.y) cursor.set('prabina_acs', id, 'y', sprintf('%d', int(args.y)));
+
+	cursor.commit('prabina_acs');
+	fs.chmod('/etc/config/prabina_acs', 0600);
+
+	try { fs.unlink('/var/run/prabina_acs_cache.json'); } catch(e) {}
+
+	return { success: true };
+}
+
+function delete_device(args) {
+	let id = trim(args.id || '');
+	if (length(id) == 0 || id == 'local') {
+		return { success: false, error: 'Cannot delete Header Gateway' };
+	}
+
+	cursor.load('prabina_acs');
+	let sec = cursor.get_all('prabina_acs', id);
+	if (!sec) return { success: false, error: 'Device not found' };
+
+	let fallback_parent = sec.parent || 'local';
+	if (fallback_parent == id) fallback_parent = 'local';
+
+	// Collect any child devices to reparent so tree is not broken
+	let children_to_reparent = [];
+	cursor.foreach('prabina_acs', 'device', function(s) {
+		if (s.parent == id) {
+			push(children_to_reparent, s['.name']);
+		}
+	});
+	for (let cid in children_to_reparent) {
+		cursor.set('prabina_acs', cid, 'parent', fallback_parent);
+	}
+
+	cursor.delete('prabina_acs', id);
+	cursor.commit('prabina_acs');
+	fs.chmod('/etc/config/prabina_acs', 0600);
+
+	// Invalidate status cache and clean up rates
+	try {
+		fs.unlink('/var/run/prabina_acs_cache.json');
+	} catch(e) {}
+
+	try {
+		let rate_file = '/var/run/prabina_acs_rates.json';
+		let raw_rates = fs.readfile(rate_file);
+		if (raw_rates) {
+			let lines = split(raw_rates, '\n');
+			let filtered = [];
+			let prefix = id + ':';
+			for (let line in lines) {
+				if (index(line, prefix) != 0 && length(trim(line)) > 0) {
+					push(filtered, line);
+				}
+			}
+			fs.writefile(rate_file, join('\n', filtered) + '\n');
+		}
+	} catch(e) {}
+
+	return { success: true };
+}
+
+function save_topology(args) {
+	let nodes = args.nodes;
+	if (!nodes || type(nodes) != 'array') {
+		return { success: false, error: 'Expected array of nodes' };
+	}
+
+	cursor.load('prabina_acs');
+	for (let n in nodes) {
+		if (!n.id) continue;
+		let sec = cursor.get('prabina_acs', n.id);
+		if (!sec) {
+			if (n.id == 'local') {
+				cursor.set('prabina_acs', 'local', 'device');
+			} else {
+				continue;
+			}
+		}
+		if (n.x != null) cursor.set('prabina_acs', n.id, 'x', sprintf('%d', int(n.x)));
+		if (n.y != null) cursor.set('prabina_acs', n.id, 'y', sprintf('%d', int(n.y)));
+		if (n.role && n.id != 'local') {
+			let r = trim(n.role);
+			cursor.set('prabina_acs', n.id, 'role', r);
+			if (r == 'header') {
+				cursor.set('prabina_acs', n.id, 'parent', '');
+			} else if (n.parent && n.parent != n.id) {
+				cursor.set('prabina_acs', n.id, 'parent', trim(n.parent));
+			}
+		} else if (n.parent && n.id != 'local' && n.parent != n.id) {
+			cursor.set('prabina_acs', n.id, 'parent', trim(n.parent));
+		}
+	}
+
+	cursor.commit('prabina_acs');
+	fs.chmod('/etc/config/prabina_acs', 0600);
+	return { success: true };
+}
+
+function get_status(args) {
+	let target = trim(args.target || 'all');
+	let force = args.force ? 'force' : 'normal';
+
+	let cmd = sprintf('/usr/bin/prabina-acs-status "%s" "%s" 2>/dev/null', target, force);
+	let p = fs.popen(cmd);
+	if (p) {
+		let raw = p.read('all');
+		p.close();
+		if (raw) {
+			try {
+				let parsed = json(raw);
+				if (parsed) return parsed;
+			} catch(e) {}
+		}
+	}
+	return { timestamp: time(), devices: {} };
+}
+
+function push_mac(args) {
+	let mode = trim(args.mode || 'add');
+	let raw_macs = args.macs;
+	let target = trim(args.target || '');
+
+	if (mode != 'add' && mode != 'replace') mode = 'add';
+	if (!raw_macs) return { success: false, error: 'No MAC addresses supplied' };
+
+	let mac_text = '';
+	if (type(raw_macs) == 'array') {
+		mac_text = join(' ', raw_macs);
+	} else {
+		mac_text = sprintf('%s', raw_macs);
+	}
+
+	// Write macs safely to temp file
+	let tmp_file = '/tmp/prabina_acs_macs_' + time() + '.txt';
+	fs.writefile(tmp_file, mac_text);
+
+	let cmd = sprintf('/usr/bin/prabina-acs-mac "%s" "%s" "%s"', mode, tmp_file, target);
+	let p = fs.popen(cmd);
+	let result = { success: false, error: 'Command execution failed' };
+	if (p) {
+		let raw = p.read('all');
+		p.close();
+		if (raw) {
+			try {
+				result = json(raw) || result;
+			} catch(e) {}
+		}
+	}
+
+	fs.unlink(tmp_file);
+	return result;
+}
+
+function test_ssh(args) {
+	let ip = trim(args.ip || '');
+	let id = trim(args.id || '');
+	let username = trim(args.username || 'root');
+	let password = args.password || '';
+	let port = int(args.port || 22);
+
+	let cmd = '';
+	if (length(id) > 0 && length(ip) == 0) {
+		cmd = sprintf('/usr/bin/prabina-acs-ssh test-id "%s"', id);
+	} else {
+		cmd = sprintf('/usr/bin/prabina-acs-ssh test "%s" "%s" "%s" "%d"', ip, username, password, port);
+	}
+
+	let p = fs.popen(cmd);
+	if (p) {
+		let raw = p.read('all');
+		p.close();
+		if (raw) {
+			try {
+				let res = json(raw);
+				if (res) return res;
+			} catch(e) {}
+		}
+	}
+	return { success: false, error: 'SSH probe execution failed' };
+}
+
+if (action == 'list') {
+	print(sprintf('%J\n', {
+		list_devices: {},
+		add_device: { name: "String", ip: "String", username: "String", password: "String", type: "String", role: "String", parent: "String", port: "Integer" },
+		edit_device: { id: "String", name: "String", ip: "String", username: "String", password: "String", type: "String", role: "String", parent: "String", port: "Integer", x: "Integer", y: "Integer" },
+		delete_device: { id: "String" },
+		save_topology: { nodes: "Array" },
+		get_status: { target: "String", force: "Boolean" },
+		push_mac: { mode: "String", macs: "String", target: "String" },
+		test_ssh: { id: "String", ip: "String", username: "String", password: "String", port: "Integer" },
+		get_gateway_info: {}
+	}));
+} else if (action == 'call') {
+	let args = read_stdin_json();
+	if (method == 'list_devices') {
+		print(sprintf('%J\n', list_devices()));
+	} else if (method == 'add_device') {
+		print(sprintf('%J\n', add_device(args)));
+	} else if (method == 'edit_device') {
+		print(sprintf('%J\n', edit_device(args)));
+	} else if (method == 'delete_device') {
+		print(sprintf('%J\n', delete_device(args)));
+	} else if (method == 'save_topology') {
+		print(sprintf('%J\n', save_topology(args)));
+	} else if (method == 'get_status') {
+		print(sprintf('%J\n', get_status(args)));
+	} else if (method == 'push_mac') {
+		print(sprintf('%J\n', push_mac(args)));
+	} else if (method == 'test_ssh') {
+		print(sprintf('%J\n', test_ssh(args)));
+	} else if (method == 'get_gateway_info') {
+		print(sprintf('%J\n', { success: true, hostname: get_hostname(), ip: get_tailscale_ip() }));
+	} else {
+		print('{"error":"Method not found"}\n');
+	}
+} else {
+	print('{"error":"Invalid action"}\n');
+}

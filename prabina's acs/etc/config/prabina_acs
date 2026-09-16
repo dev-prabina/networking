@@ -1,0 +1,12 @@
+config global 'settings'
+	option enabled '1'
+	option refresh_interval '20'
+	option default_ssh_user 'root'
+
+config device 'local'
+	option name 'Header Gateway'
+	option ip '100.64.2.1'
+	option type 'header_gateway'
+	option role 'header'
+	option x '450'
+	option y '70'
